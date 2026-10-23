@@ -386,6 +386,74 @@ header[data-testid="stHeader"] {{
     border-radius: 8px;
     padding: 5px 10px;
 }}
+
+/* Training Status Banner */
+.ts-banner {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+    background: linear-gradient(135deg, #161b22 0%, #11161e 100%);
+    border: 1px solid #2b323d;
+    border-radius: 14px;
+    padding: 16px 20px;
+    margin: 4px 0 18px 0;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}}
+.ts-left {{
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-width: 260px;
+    flex: 1;
+}}
+.ts-badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 11px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}}
+.ts-headline {{
+    font-size: 0.84rem;
+    color: #8b949e;
+    margin-top: 4px;
+}}
+.ts-metrics {{
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+}}
+.ts-chip {{
+    background: #0d1117;
+    border: 1px solid #262c36;
+    border-radius: 10px;
+    padding: 8px 13px;
+    min-width: 125px;
+}}
+.ts-chip-lbl {{
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #8b949e;
+}}
+.ts-chip-val {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.98rem;
+    font-weight: 700;
+    color: #f0f6fc;
+    margin-top: 2px;
+}}
+.ts-chip-sub {{
+    font-size: 0.7rem;
+    color: #8b949e;
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -467,7 +535,7 @@ with st.sidebar:
         f'<div style="font-size:0.74rem;color:#8b949e;">Personal API Telemetry</div></div></div>',
         unsafe_allow_html=True,
     )
-    days = st.select_slider("History window (days)", [30, 60, 90, 180, 365], 90)
+    days = st.select_slider("History window (days)", [30, 60, 90, 180, 365], 365)
     ui_api_key = ""
     if not secret_api_key and not secret_access_token:
         ui_api_key = st.text_input(
@@ -503,10 +571,22 @@ except Exception as e:
 acts, sleep, hrv, daily, vo2, preds = (
     D[k] for k in ["activities", "sleep", "hrv", "daily", "vo2max", "predictions"]
 )
+ts = D.get("training_status") or data._compute_training_status(acts, vo2, hrv, daily, days)
 acts["day"] = pd.to_datetime(acts["date"]).dt.normalize()
 
 with st.sidebar:
     st.divider()
+    st.markdown(
+        f'<div style="background:#12171f;border:1px solid {ts["color"]}44;border-radius:10px;padding:12px 14px;margin-bottom:10px;">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">'
+        f'  <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;">Training Status</span>'
+        f'  <span style="font-size:0.72rem;font-weight:700;color:{ts["color"]};background:{ts["color"]}1f;padding:2px 8px;border-radius:999px;">{ts["status"]}</span>'
+        f'</div>'
+        f'<div style="font-size:0.78rem;color:#c9d1d9;margin-top:4px;">'
+        f'7d Load: <b>{ts["acute_load"]}</b> <span style="color:#8b949e;">(Opt {ts["opt_low"]}–{ts["opt_high"]})</span> · ACWR <b>{ts["acwr"]:.2f}</b></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     if not acts.empty:
         latest_act = acts.sort_values("date", ascending=False).iloc[0]
         st.markdown(
@@ -642,6 +722,49 @@ with tabs[0]:
         f"Score {sleep.score.mean():.0f}/100" if len(sleep) and sleep.score.notna().any() else "Nightly average",
         "sleep",
         "#a371f7",
+    )
+
+    # Garmin Training Status Banner
+    ts_col = ts["color"]
+    vo2_sign = f"{ts['vo2_delta_4w']:+.1f}" if ts.get("vo2_delta_4w") else "0.0"
+    st.markdown(
+        f'<div class="ts-banner" style="border-left: 4px solid {ts_col};">'
+        f'  <div class="ts-left">'
+        f'    {icon_html("optimalhealth", size=24, bg=f"{ts_col}22", accent=ts_col, badge=True, mr=2)}'
+        f'    <div>'
+        f'      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+        f'        <span style="font-size:0.76rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;">Training Status</span>'
+        f'        <span class="ts-badge" style="background:{ts_col}22;color:{ts_col};border:1px solid {ts_col}55;">'
+        f'          <span class="status-dot"></span>{ts["status"]}'
+        f'        </span>'
+        f'      </div>'
+        f'      <div class="ts-headline">{ts["headline"]}</div>'
+        f'    </div>'
+        f'  </div>'
+        f'  <div class="ts-metrics">'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">7d Acute Load</div>'
+        f'      <div class="ts-chip-val">{ts["acute_load"]} <span style="font-size:0.75rem;color:{ts_col};">({ts["load_status"]})</span></div>'
+        f'      <div class="ts-chip-sub">Optimal: {ts["opt_low"]}–{ts["opt_high"]}</div>'
+        f'    </div>'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">Load Ratio (ACWR)</div>'
+        f'      <div class="ts-chip-val">{ts["acwr"]:.2f}x</div>'
+        f'      <div class="ts-chip-sub">28d Chronic: {ts["chronic_load"]}</div>'
+        f'    </div>'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">VO₂max Trend</div>'
+        f'      <div class="ts-chip-val">{ts["vo2_trend"]}</div>'
+        f'      <div class="ts-chip-sub">4w delta: {vo2_sign} mL/kg</div>'
+        f'    </div>'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">HRV Status</div>'
+        f'      <div class="ts-chip-val">{ts["hrv_status"]}</div>'
+        f'      <div class="ts-chip-sub">Autonomic recovery</div>'
+        f'    </div>'
+        f'  </div>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
 
     section_header("Training Consistency", f"{len(acts)} workouts across all sports", "overview", "#39d353")
@@ -831,27 +954,35 @@ with tabs[4]:
 
 # --------------------------------------------------------------- 5. Recovery & Fitness
 with tabs[5]:
-    c = st.columns(5)
-    vo2_delta = f"{vo2.vo2max.iloc[-1] - vo2.vo2max.iloc[0]:+.1f} vs start" if len(vo2) > 1 else "Latest estimate"
-    kpi_card(c[0], "VO₂max", f"{vo2.vo2max.iloc[-1]:.1f}" if len(vo2) else "–", vo2_delta, "optimalhealth", "#f78166")
+    c = st.columns(6)
     kpi_card(
-        c[1],
-        "HRV (Last Night)",
-        f"{hrv.hrv.iloc[-1]:.0f} ms" if len(hrv) else "–",
-        f"7d avg: {hrv.weekly_avg.dropna().iloc[-1]:.0f} ms" if len(hrv) and hrv.weekly_avg.notna().any() else "Overnight RMSSD",
-        "recovery",
-        "#39d353",
+        c[0],
+        "Training Status",
+        ts["status"],
+        f"ACWR {ts['acwr']:.2f}x · {ts['load_status']} load",
+        "optimalhealth",
+        ts["color"],
     )
     kpi_card(
-        c[2],
-        "HRV Status",
-        str(hrv.status.iloc[-1]).replace("_", " ").title() if len(hrv) else "–",
-        "Autonomic balance",
-        "insights",
+        c[1],
+        "7d Acute Load",
+        f"{ts['acute_load']}",
+        f"Optimal: {ts['opt_low']}–{ts['opt_high']}",
+        "speed",
+        "#39d353" if ts["load_status"] == "Optimal" else "#e3b341",
+    )
+    vo2_delta = f"{vo2.vo2max.iloc[-1] - vo2.vo2max.iloc[0]:+.1f} vs start" if len(vo2) > 1 else "Latest estimate"
+    kpi_card(c[2], "VO₂max", f"{vo2.vo2max.iloc[-1]:.1f}" if len(vo2) else "–", vo2_delta, "running", "#f78166")
+    kpi_card(
+        c[3],
+        "HRV (Last Night)",
+        f"{hrv.hrv.iloc[-1]:.0f} ms" if len(hrv) else "–",
+        f"7d avg: {hrv.weekly_avg.dropna().iloc[-1]:.0f} ms · {ts['hrv_status']}" if len(hrv) and hrv.weekly_avg.notna().any() else ts["hrv_status"],
+        "recovery",
         "#58a6ff",
     )
     kpi_card(
-        c[3],
+        c[4],
         "Resting HR",
         f"{daily.resting_hr.dropna().iloc[-1]:.0f} bpm" if len(daily) and daily.resting_hr.notna().any() else "–",
         f"Min: {daily.resting_hr.min():.0f} bpm" if len(daily) and daily.resting_hr.notna().any() else "–",
@@ -859,13 +990,77 @@ with tabs[5]:
         "#f85149",
     )
     kpi_card(
-        c[4],
+        c[5],
         "Body Battery High",
         f"{daily.body_battery_high.dropna().iloc[-1]:.0f}" if len(daily) and daily.body_battery_high.notna().any() else "–",
         f"Avg stress: {daily.stress.mean():.0f}" if len(daily) and daily.stress.notna().any() else "Daily peak charge",
         "calories",
         "#e3b341",
     )
+
+    section_header(
+        f"Training Status: {ts['status']}",
+        ts["headline"],
+        "optimalhealth",
+        ts["color"],
+    )
+    tl_col, tf_col = st.columns([1.45, 1])
+    hist_df = ts.get("history")
+    if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
+        lfig = go.Figure()
+        lfig.add_traces([
+            go.Scatter(x=hist_df["date"], y=hist_df["opt_high"], line=dict(width=0), showlegend=False, hoverinfo="skip"),
+            go.Scatter(
+                x=hist_df["date"],
+                y=hist_df["opt_low"],
+                fill="tonexty",
+                line=dict(width=0),
+                fillcolor="rgba(57, 211, 83, 0.18)",
+                name="Optimal Load Tunnel (0.8–1.3×)",
+            ),
+        ])
+        lfig.add_trace(
+            go.Scatter(
+                x=hist_df["date"],
+                y=hist_df["chronic_load"],
+                mode="lines",
+                name="28d Chronic Load",
+                line=dict(color="#8b949e", width=1.6, dash="dot"),
+            )
+        )
+        lfig.add_trace(
+            go.Scatter(
+                x=hist_df["date"],
+                y=hist_df["acute_load"],
+                mode="lines+markers",
+                name="7d Acute Load",
+                line=dict(color=ts["color"], width=2.6),
+                marker=dict(size=4, color=ts["color"]),
+            )
+        )
+        lfig.update_layout(title="7-Day Acute Load vs. Optimal Chronic Tunnel")
+        tl_col.plotly_chart(layout(lfig, 330), width="stretch")
+
+    focus_dict = ts.get("focus") or {"Low Aerobic": 0, "High Aerobic": 0, "Anaerobic": 0}
+    tot_focus = max(1, sum(focus_dict.values()))
+    fdf = pd.DataFrame([
+        {"Zone": k, "Load": v, "Share": f"{v} ({v / tot_focus * 100:.0f}%)"}
+        for k, v in focus_dict.items()
+    ])
+    ffig = px.bar(
+        fdf,
+        x="Load",
+        y="Zone",
+        orientation="h",
+        color="Zone",
+        text="Share",
+        color_discrete_map={"Low Aerobic": "#58a6ff", "High Aerobic": "#f78166", "Anaerobic": "#a371f7"},
+        title="4-Week Training Load Focus",
+    )
+    ffig.update_traces(textposition="outside")
+    ffig.update_xaxes(range=[0, max(fdf["Load"].max() * 1.28, 10)])
+    ffig.update_layout(showlegend=False)
+    tf_col.plotly_chart(layout(ffig, 330), width="stretch")
 
     l, r = st.columns(2)
     if len(vo2):
