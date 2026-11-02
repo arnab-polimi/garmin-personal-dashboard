@@ -115,6 +115,7 @@ TAB_SPECS = [
     ("Sleep", "sleep"),
     ("Recovery & Fitness", "recovery"),
     ("Race Predictions", "race_predictor"),
+    ("Insights", "insights"),
     ("Activity Log", "plan"),
 ]
 
@@ -1504,8 +1505,252 @@ with tabs[7]:
             section_header("Recommended Training Zones", "Paces calibrated from your race profile", "speed", "#58a6ff")
             st.dataframe(zones, width="stretch", hide_index=True)
 
-# --------------------------------------------------------------- 8. Activity Log
+# --------------------------------------------------------------- 8. Insights & Cross-Activity Correlations
 with tabs[8]:
+    ci = data.compute_correlations_and_insights(acts, sleep, hrv, daily, hevy_workouts, hevy_sets, days)
+    master = ci["master"]
+    insights_list = ci["insights"]
+    corr_mat = ci["corr_matrix"]
+    corr_labels = ci["corr_labels"]
+
+    section_header(
+        "Auto-Discovered Physiological & Cross-Sport Patterns",
+        f"Statistical relationships mined across your last {days} days of Garmin + Hevy telemetry",
+        "insights",
+        "#58a6ff",
+    )
+
+    if insights_list:
+        ins_cols = st.columns(2)
+        for idx_i, ins in enumerate(insights_list):
+            col_i = ins_cols[idx_i % 2]
+            acc = ins["accent"]
+            r_val = ins["r"]
+            r_badge = f"r = {r_val:+.2f} · n={ins['n']}"
+            col_i.markdown(
+                f'<div class="kpi-card" style="border-left: 4px solid {acc}; padding: 16px 18px;">'
+                f'  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px;">'
+                f'    <div style="display:flex;align-items:center;gap:8px;">'
+                f'      {icon_html(ins["icon"], size=17, bg=f"{acc}1f", accent=acc, badge=True, mr=2)}'
+                f'      <div>'
+                f'        <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.06em;color:{acc};font-weight:700;">{ins["category"]}</div>'
+                f'        <div style="font-size:0.96rem;font-weight:700;color:#f0f6fc;">{ins["title"]}</div>'
+                f'      </div>'
+                f'    </div>'
+                f'    <div style="text-align:right;flex-shrink:0;">'
+                f'      <div style="font-family:\'JetBrains Mono\',monospace;font-size:0.95rem;font-weight:700;color:{acc};">{ins["metric"]}</div>'
+                f'      <div style="font-size:0.68rem;color:#8b949e;">{r_badge}</div>'
+                f'    </div>'
+                f'  </div>'
+                f'  <div style="font-size:0.82rem;color:#c9d1d9;line-height:1.48;">{ins["summary"]}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Correlation Matrix + Top Ranked Pairs
+    if not corr_mat.empty:
+        section_header(
+            "Multi-System Telemetry Correlation Matrix",
+            "Pearson r (-1.0 to +1.0) across Cardio, Strength, Sleep, and Autonomic Recovery",
+            "optimalhealth",
+            "#39d353",
+        )
+        m_left, m_right = st.columns([1.45, 1])
+        cfig = px.imshow(
+            corr_mat,
+            text_auto=".2f",
+            color_continuous_scale=["#f85149", "#161b22", "#39d353"],
+            zmin=-1,
+            zmax=1,
+            aspect="auto",
+            title="Cross-Domain Correlation Heatmap (Pearson r)",
+        )
+        cfig.update_layout(coloraxis_showscale=True)
+        m_left.plotly_chart(layout(cfig, 420), width="stretch")
+
+        pair_rows = []
+        cols_c = list(corr_mat.columns)
+        for i in range(len(cols_c)):
+            for j in range(i + 1, len(cols_c)):
+                rv = float(corr_mat.iloc[i, j])
+                if pd.notna(rv):
+                    strength = (
+                        "Strong" if abs(rv) >= 0.50
+                        else "Moderate" if abs(rv) >= 0.30
+                        else "Mild" if abs(rv) >= 0.15
+                        else "Weak"
+                    )
+                    pair_rows.append({
+                        "Metric A": cols_c[i],
+                        "Metric B": cols_c[j],
+                        "Pearson r": rv,
+                        "Abs_r": abs(rv),
+                        "Strength": f"{strength} ({'Positive' if rv > 0 else 'Inverse'})",
+                    })
+        if pair_rows:
+            top_pairs = (
+                pd.DataFrame(pair_rows)
+                .sort_values("Abs_r", ascending=False)
+                .drop(columns=["Abs_r"])
+                .head(12)
+                .reset_index(drop=True)
+            )
+            with m_right:
+                st.markdown(
+                    '<div style="font-size:0.86rem;font-weight:700;color:#f0f6fc;margin:6px 0 10px 0;">'
+                    'Strongest Detected Signal Pairs</div>',
+                    unsafe_allow_html=True,
+                )
+                st.dataframe(top_pairs, width="stretch", hide_index=True, height=375)
+
+    # Deep-Dive Cross-Activity Charts
+    section_header(
+        "Cross-Activity Deep Dives",
+        "How sleep, workout time-of-day, leg-day lifting, and stress interact",
+        "recovery",
+        "#a371f7",
+    )
+    d1, d2 = st.columns(2)
+
+    w_timing = master.dropna(subset=["latest_workout_hour", "next_day_rhr_bpm"]).copy()
+    if len(w_timing) >= 4:
+        w_timing["Time Bucket"] = np.where(
+            w_timing["latest_workout_hour"] < 12.0,
+            "Morning (<12:00)",
+            np.where(w_timing["latest_workout_hour"] < 17.5, "Afternoon (12:00–17:30)", "Evening (≥17:30)"),
+        )
+        tfig = px.scatter(
+            w_timing,
+            x="latest_workout_hour",
+            y="next_day_rhr_bpm",
+            color="Time Bucket",
+            size=w_timing["hybrid_load"].clip(lower=15),
+            color_discrete_map={
+                "Morning (<12:00)": "#39d353",
+                "Afternoon (12:00–17:30)": "#58a6ff",
+                "Evening (≥17:30)": "#f85149",
+            },
+            hover_data={"day": True, "garmin_load": ":.0f", "tonight_sleep_score": ":.0f"},
+            labels={"latest_workout_hour": "Workout Start Hour (24h)", "next_day_rhr_bpm": "Next-Morning RHR (bpm)"},
+            title="Workout Time-of-Day vs. Next-Morning Resting HR (bubble = load)",
+        )
+        if len(w_timing) >= 5 and w_timing["latest_workout_hour"].std() > 0:
+            m_slope, b_int = np.polyfit(w_timing["latest_workout_hour"], w_timing["next_day_rhr_bpm"], 1)
+            xs = np.linspace(w_timing["latest_workout_hour"].min(), w_timing["latest_workout_hour"].max(), 30)
+            tfig.add_trace(
+                go.Scatter(x=xs, y=m_slope * xs + b_int, mode="lines", name="Trend", line=dict(color="#f0f6fc", width=1.8, dash="dash"))
+            )
+        d1.plotly_chart(layout(tfig, 340), width="stretch")
+
+    st_rec = master.dropna(subset=["stress", "sleep_score"]).copy()
+    if len(st_rec) >= 4:
+        sfig = px.scatter(
+            st_rec,
+            x="stress",
+            y="sleep_score",
+            color="rhr_bpm",
+            color_continuous_scale="Turbo",
+            hover_data={"day": True, "sleep_h": ":.1f"},
+            labels={"stress": "Daily Stress Level", "sleep_score": "Garmin Sleep Score", "rhr_bpm": "RHR (bpm)"},
+            title="Daily Stress vs. Sleep Score (color = Resting HR)",
+        )
+        if len(st_rec) >= 5 and st_rec["stress"].std() > 0:
+            m_s, b_s = np.polyfit(st_rec["stress"], st_rec["sleep_score"], 1)
+            xs = np.linspace(st_rec["stress"].min(), st_rec["stress"].max(), 30)
+            sfig.add_trace(
+                go.Scatter(x=xs, y=m_s * xs + b_s, mode="lines", name="OLS Fit", line=dict(color="#a371f7", width=2.2, dash="dash"))
+            )
+        d2.plotly_chart(layout(sfig, 340), width="stretch")
+
+    # Interactive Custom Correlation Lab
+    section_header(
+        "Interactive Correlation Explorer",
+        "Test any two metrics (including next-day lag effects) with live linear regression",
+        "curious",
+        "#e3b341",
+    )
+    lab_metrics = {
+        "garmin_load": "Garmin Cardio Load",
+        "hybrid_load": "Combined Hybrid Load (Garmin + Hevy)",
+        "run_eff": "Running Aerobic Efficiency (m/beat)",
+        "run_km": "Daily Running Distance (km)",
+        "run_hr": "Average Running HR (bpm)",
+        "bike_km": "Daily Cycling Distance (km)",
+        "lift_volume_kg": "Hevy Lifting Tonnage (kg)",
+        "leg_volume_kg": "Hevy Leg-Day Tonnage (kg)",
+        "latest_workout_hour": "Workout Start Hour (24h)",
+        "steps": "Daily Steps",
+        "sleep_h": "Sleep Duration (hours)",
+        "sleep_score": "Garmin Sleep Score",
+        "deep_pct": "Deep Sleep Share (%)",
+        "rem_pct": "REM Sleep Share (%)",
+        "hrv_ms": "Nightly HRV (ms)",
+        "rhr_bpm": "Resting Heart Rate (bpm)",
+        "body_battery": "Body Battery Peak",
+        "stress": "Daily Stress Level",
+    }
+    avail_lab = [k for k in lab_metrics if k in master.columns and master[k].notna().sum() >= 4]
+    if len(avail_lab) >= 2:
+        c_x, c_y, c_lag = st.columns([1.2, 1.2, 1])
+        def_x = "stress" if "stress" in avail_lab else avail_lab[0]
+        def_y = "sleep_score" if "sleep_score" in avail_lab else avail_lab[min(1, len(avail_lab) - 1)]
+        x_col = c_x.selectbox("X-Axis (Predictor)", avail_lab, index=avail_lab.index(def_x), format_func=lambda k: lab_metrics[k])
+        y_col = c_y.selectbox("Y-Axis (Outcome)", avail_lab, index=avail_lab.index(def_y), format_func=lambda k: lab_metrics[k])
+        lag_mode = c_lag.selectbox(
+            "Time Alignment",
+            ["Same Day (t → t)", "Next Day Outcome (t → t+1)", "48h Outcome (t → t+2)"],
+            index=0,
+        )
+        shift_n = -1 if "t+1" in lag_mode else (-2 if "t+2" in lag_mode else 0)
+        df_lab = pd.DataFrame({
+            "day": master["day"],
+            "x": master[x_col],
+            "y": master[y_col].shift(shift_n) if shift_n != 0 else master[y_col],
+        })
+        workout_zero_cols = {"garmin_load", "hybrid_load", "run_km", "bike_km", "lift_volume_kg", "leg_volume_kg"}
+        if x_col in workout_zero_cols:
+            df_lab = df_lab[df_lab["x"] > 0]
+        if y_col in workout_zero_cols:
+            df_lab = df_lab[df_lab["y"] > 0]
+        df_lab = df_lab.dropna(subset=["x", "y"])
+
+        if len(df_lab) >= 4 and df_lab["x"].std() > 0 and df_lab["y"].std() > 0:
+            r_custom, n_custom = data._pearson(df_lab["x"], df_lab["y"])
+            slope, intercept = np.polyfit(df_lab["x"], df_lab["y"], 1)
+            xs = np.linspace(df_lab["x"].min(), df_lab["x"].max(), 40)
+            y_label_full = f"{lab_metrics[y_col]} ({lag_mode.split('(')[1][:-1]})"
+            custom_fig = go.Figure()
+            custom_fig.add_trace(
+                go.Scatter(
+                    x=df_lab["x"],
+                    y=df_lab["y"],
+                    mode="markers",
+                    name="Daily Observations",
+                    text=df_lab["day"].dt.strftime("%d %b %Y"),
+                    hovertemplate=f"<b>%{{text}}</b><br>{lab_metrics[x_col]}: %{{x:.2f}}<br>{lab_metrics[y_col]}: %{{y:.2f}}<extra></extra>",
+                    marker=dict(size=8, color="#58a6ff", opacity=0.82, line=dict(width=1, color="#161b22")),
+                )
+            )
+            custom_fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=slope * xs + intercept,
+                    mode="lines",
+                    name=f"Linear Fit (r = {r_custom:+.2f})",
+                    line=dict(color="#e3b341", width=2.5, dash="dash"),
+                )
+            )
+            custom_fig.update_layout(
+                title=f"{lab_metrics[x_col]} vs. {y_label_full} — Pearson r = {r_custom:+.2f} (n = {n_custom} days)",
+                xaxis_title=lab_metrics[x_col],
+                yaxis_title=y_label_full,
+            )
+            st.plotly_chart(layout(custom_fig, 360), width="stretch")
+        else:
+            st.info("Not enough overlapping non-zero days for this metric pair yet — try expanding the History window in the sidebar.")
+
+# --------------------------------------------------------------- 9. Activity Log
+with tabs[9]:
     f1, f2 = st.columns([2, 1])
     cats = f1.multiselect("Filter by sport", list(COLORS), default=list(COLORS))
     limit = f2.selectbox("Show recent", [30, 60, 100, 250], index=1)

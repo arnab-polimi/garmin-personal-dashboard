@@ -1259,3 +1259,343 @@ def demo_hevy(days: int) -> dict:
         "user": {"username": "demo_lifter", "weight_unit": "kg", "is_pro": True},
     }
 
+
+
+# =========================================================
+# 5. CROSS-DOMAIN PATTERN & CORRELATION ENGINE
+# =========================================================
+def _pearson(x: pd.Series, y: pd.Series) -> tuple[float, int]:
+    """Return (Pearson r, sample_size n) for two aligned Series."""
+    df_xy = pd.DataFrame({"x": pd.to_numeric(x, errors="coerce"), "y": pd.to_numeric(y, errors="coerce")}).dropna()
+    n = len(df_xy)
+    if n < 5 or df_xy["x"].std() == 0 or df_xy["y"].std() == 0:
+        return 0.0, n
+    r = float(df_xy["x"].corr(df_xy["y"]))
+    return (round(r, 2) if pd.notna(r) else 0.0), n
+
+
+def compute_correlations_and_insights(
+    acts: pd.DataFrame,
+    sleep: pd.DataFrame,
+    hrv: pd.DataFrame,
+    daily: pd.DataFrame,
+    hevy_workouts: pd.DataFrame,
+    hevy_sets: pd.DataFrame,
+    days: int,
+) -> dict:
+    """Build a unified daily telemetry matrix across Garmin + Hevy and extract cross-activity patterns."""
+    end = pd.Timestamp(date.today()).normalize()
+    start = end - pd.Timedelta(days=days)
+    idx = pd.date_range(start, end, freq="D")
+    master = pd.DataFrame({"day": idx})
+
+    # 1. Garmin Activities aggregation by day
+    if not acts.empty and acts["date"].notna().any():
+        ac = acts.copy()
+        ac["day"] = pd.to_datetime(ac["date"]).dt.normalize()
+        ac["load_est"] = ac.apply(_estimate_activity_load, axis=1)
+        ac["start_hour"] = pd.to_datetime(ac["date"]).dt.hour + pd.to_datetime(ac["date"]).dt.minute / 60.0
+        eff_mps = ac["eff_speed_mps"] if "eff_speed_mps" in ac.columns else (ac["avg_speed_kmh"] / 3.6)
+        ac["eff_m_per_beat"] = np.where(
+            (ac["category"] == "Run") & (ac["avg_hr"].notna()) & (ac["avg_hr"] > 95) & (ac["distance_km"] >= 2.0),
+            (eff_mps * 60.0) / ac["avg_hr"],
+            np.nan,
+        )
+
+        day_act = ac.groupby("day", as_index=False).agg(
+            garmin_load=("load_est", "sum"),
+            cardio_min=("duration_min", "sum"),
+            latest_workout_hour=("start_hour", "max"),
+            max_te=("training_effect", "max"),
+            max_ana_te=("anaerobic_te", "max"),
+        )
+        run_day = (
+            ac[ac["category"] == "Run"]
+            .groupby("day", as_index=False)
+            .agg(
+                run_km=("distance_km", "sum"),
+                run_min=("duration_min", "sum"),
+                run_eff=("eff_m_per_beat", "mean"),
+                run_hr=("avg_hr", "mean"),
+                run_speed_kmh=("avg_speed_kmh", "mean"),
+            )
+        )
+        bike_day = (
+            ac[ac["category"] == "Cycling"]
+            .groupby("day", as_index=False)
+            .agg(bike_km=("distance_km", "sum"), bike_min=("duration_min", "sum"))
+        )
+        walk_day = (
+            ac[ac["category"] == "Walk"]
+            .groupby("day", as_index=False)
+            .agg(walk_km=("distance_km", "sum"), walk_min=("duration_min", "sum"))
+        )
+        master = (
+            master.merge(day_act, on="day", how="left")
+            .merge(run_day, on="day", how="left")
+            .merge(bike_day, on="day", how="left")
+            .merge(walk_day, on="day", how="left")
+        )
+    else:
+        for col in [
+            "garmin_load", "cardio_min", "latest_workout_hour", "max_te", "max_ana_te",
+            "run_km", "run_min", "run_eff", "run_hr", "run_speed_kmh", "bike_km", "bike_min", "walk_km", "walk_min",
+        ]:
+            master[col] = np.nan
+
+    for zero_col in ["garmin_load", "cardio_min", "run_km", "run_min", "bike_km", "bike_min", "walk_km", "walk_min"]:
+        master[zero_col] = master[zero_col].fillna(0.0)
+
+    # 2. Hevy Strength aggregation by day
+    if not hevy_workouts.empty and "date" in hevy_workouts.columns:
+        hw = hevy_workouts.copy()
+        hw["day"] = pd.to_datetime(hw["date"]).dt.normalize()
+        hw_day = hw.groupby("day", as_index=False).agg(
+            lift_volume_kg=("volume_kg", "sum"),
+            lift_sets=("working_sets", "sum"),
+            lift_min=("duration_min", "sum"),
+            lift_rpe=("avg_rpe", "mean"),
+        )
+        master = master.merge(hw_day, on="day", how="left")
+    else:
+        for col in ["lift_volume_kg", "lift_sets", "lift_min", "lift_rpe"]:
+            master[col] = np.nan
+
+    if not hevy_sets.empty and "date" in hevy_sets.columns:
+        hs = hevy_sets[hevy_sets["set_type"] != "warmup"].copy()
+        hs["day"] = pd.to_datetime(hs["date"]).dt.normalize()
+        leg_sets = hs[hs["muscle_group"].isin(["Quadriceps", "Hamstrings & Glutes", "Calves"])]
+        leg_day = leg_sets.groupby("day", as_index=False).agg(
+            leg_volume_kg=("volume_kg", "sum"),
+            leg_sets=("set_index", "count"),
+        )
+        master = master.merge(leg_day, on="day", how="left")
+    else:
+        master["leg_volume_kg"] = 0.0
+        master["leg_sets"] = 0
+
+    for zc in ["lift_volume_kg", "lift_sets", "lift_min", "leg_volume_kg", "leg_sets"]:
+        master[zc] = master[zc].fillna(0.0)
+
+    # Combined Hybrid Load (Garmin EPOC load + scaled Hevy tonnage/sets)
+    master["hybrid_load"] = master["garmin_load"] + (master["lift_volume_kg"] / 90.0)
+
+    # Flag days within 24-48h after a heavy leg day
+    master["is_leg_day"] = master["leg_sets"] >= 4
+    master["post_leg_24_48h"] = master["is_leg_day"].shift(1, fill_value=False) | master["is_leg_day"].shift(2, fill_value=False)
+
+    # 3. Sleep, HRV, Daily Summary
+    if not sleep.empty and "date" in sleep.columns:
+        sl = sleep.copy()
+        sl["day"] = pd.to_datetime(sl["date"]).dt.normalize()
+        sl["deep_pct"] = np.where(sl["total_h"] > 0, (sl["deep_h"] / sl["total_h"]) * 100.0, np.nan)
+        sl["rem_pct"] = np.where(sl["total_h"] > 0, (sl["rem_h"] / sl["total_h"]) * 100.0, np.nan)
+        sl_keep = sl[["day", "total_h", "deep_h", "rem_h", "awake_h", "score", "deep_pct", "rem_pct"]].rename(
+            columns={
+                "total_h": "sleep_h",
+                "score": "sleep_score",
+            }
+        )
+        master = master.merge(sl_keep, on="day", how="left")
+    else:
+        for col in ["sleep_h", "deep_h", "rem_h", "awake_h", "sleep_score", "deep_pct", "rem_pct"]:
+            master[col] = np.nan
+
+    if not hrv.empty and "date" in hrv.columns:
+        hv = hrv.copy()
+        hv["day"] = pd.to_datetime(hv["date"]).dt.normalize()
+        master = master.merge(hv[["day", "hrv"]].rename(columns={"hrv": "hrv_ms"}), on="day", how="left")
+    else:
+        master["hrv_ms"] = np.nan
+
+    if not daily.empty and "date" in daily.columns:
+        dl = daily.copy()
+        dl["day"] = pd.to_datetime(dl["date"]).dt.normalize()
+        master = master.merge(
+            dl[["day", "steps", "resting_hr", "body_battery_high", "stress"]].rename(
+                columns={"resting_hr": "rhr_bpm", "body_battery_high": "body_battery"}
+            ),
+            on="day",
+            how="left",
+        )
+    else:
+        for col in ["steps", "rhr_bpm", "body_battery", "stress"]:
+            master[col] = np.nan
+
+    # Tonight's recovery metrics (stamped on `day + 1` morning) to measure how today's training affects tonight's recovery
+    master["tonight_sleep_h"] = master["sleep_h"].shift(-1)
+    master["tonight_sleep_score"] = master["sleep_score"].shift(-1)
+    master["tonight_deep_pct"] = master["deep_pct"].shift(-1)
+    master["tonight_rem_pct"] = master["rem_pct"].shift(-1)
+    master["tonight_hrv_ms"] = master["hrv_ms"].shift(-1)
+    master["next_day_rhr_bpm"] = master["rhr_bpm"].shift(-1)
+
+    # 4. Auto-discover key physiological & cross-sport insights
+    insights = []
+
+    # Insight A: Sleep Quality / Duration -> Same-Day Running Efficiency (m/beat)
+    run_sleep = master.dropna(subset=["run_eff", "sleep_h"])
+    if len(run_sleep) >= 6:
+        r_sl, n_sl = _pearson(run_sleep["sleep_h"], run_sleep["run_eff"])
+        med_sleep = float(run_sleep["sleep_h"].median())
+        high_sl_eff = float(run_sleep[run_sleep["sleep_h"] >= med_sleep]["run_eff"].mean())
+        low_sl_eff = float(run_sleep[run_sleep["sleep_h"] < med_sleep]["run_eff"].mean())
+        diff_pct = ((high_sl_eff - low_sl_eff) / max(0.01, low_sl_eff)) * 100.0
+        insights.append({
+            "title": "Sleep Duration → Running Aerobic Efficiency",
+            "category": "Sleep × Running",
+            "icon": "sleep",
+            "accent": "#a371f7",
+            "r": r_sl,
+            "n": n_sl,
+            "metric": f"{diff_pct:+.1f}% m/beat",
+            "summary": (
+                f"After sleeping ≥{med_sleep:.1f}h, your running economy averages "
+                f"<b>{high_sl_eff:.2f} m/beat</b> vs. <b>{low_sl_eff:.2f} m/beat</b> on shorter sleep "
+                f"({diff_pct:+.1f}% efficiency per heartbeat across {n_sl} runs)."
+            ),
+        })
+
+    # Insight B: Workout Time-of-Day -> Overnight Sleep Score & RHR
+    timed_w = master[master["latest_workout_hour"].notna()].copy()
+    if len(timed_w) >= 6:
+        late = timed_w[timed_w["latest_workout_hour"] >= 17.5]
+        early = timed_w[timed_w["latest_workout_hour"] < 17.5]
+        r_hr, _ = _pearson(timed_w["latest_workout_hour"], timed_w["next_day_rhr_bpm"])
+        if len(late) >= 2 and len(early) >= 2 and timed_w["next_day_rhr_bpm"].notna().any():
+            late_rhr = float(late["next_day_rhr_bpm"].dropna().mean()) if late["next_day_rhr_bpm"].notna().any() else 0
+            early_rhr = float(early["next_day_rhr_bpm"].dropna().mean()) if early["next_day_rhr_bpm"].notna().any() else 0
+            late_sc = float(late["tonight_sleep_score"].dropna().mean()) if late["tonight_sleep_score"].notna().any() else 0
+            early_sc = float(early["tonight_sleep_score"].dropna().mean()) if early["tonight_sleep_score"].notna().any() else 0
+            rhr_diff = late_rhr - early_rhr
+            sc_diff = late_sc - early_sc
+            insights.append({
+                "title": "Evening Workouts (≥17:30) → Overnight Autonomic Recovery",
+                "category": "Timing × Recovery",
+                "icon": "heartbeat",
+                "accent": "#f85149",
+                "r": r_hr,
+                "n": len(timed_w),
+                "metric": f"{rhr_diff:+.1f} bpm RHR",
+                "summary": (
+                    f"Sessions starting after 17:30 shift next-morning Resting HR by <b>{rhr_diff:+.1f} bpm</b> "
+                    f"({late_rhr:.1f} vs. {early_rhr:.1f} bpm) and Sleep Score by <b>{sc_diff:+.1f} pts</b> "
+                    f"compared to earlier training."
+                ),
+            })
+
+    # Insight C: Hevy Leg Day Interference -> Running Economy (24-48h later)
+    runs_only = master[master["run_eff"].notna()].copy()
+    post_leg_runs = runs_only[runs_only["post_leg_24_48h"]]
+    fresh_runs = runs_only[~runs_only["post_leg_24_48h"]]
+    if len(post_leg_runs) >= 2 and len(fresh_runs) >= 2:
+        leg_eff = float(post_leg_runs["run_eff"].mean())
+        fr_eff = float(fresh_runs["run_eff"].mean())
+        leg_hr = float(post_leg_runs["run_hr"].mean())
+        fr_hr = float(fresh_runs["run_hr"].mean())
+        eff_delta_pct = ((leg_eff - fr_eff) / max(0.01, fr_eff)) * 100.0
+        hr_delta = leg_hr - fr_hr
+        insights.append({
+            "title": "Hevy Leg-Day Interference → 48h Running Economy",
+            "category": "Strength × Running",
+            "icon": "strength",
+            "accent": "#e3b341",
+            "r": round(eff_delta_pct / 100.0, 2),
+            "n": len(runs_only),
+            "metric": f"{eff_delta_pct:+.1f}% economy",
+            "summary": (
+                f"Running within 24–48h of a Hevy leg session yields <b>{leg_eff:.2f} m/beat</b> "
+                f"(avg HR {leg_hr:.0f} bpm) vs. <b>{fr_eff:.2f} m/beat</b> (avg HR {fr_hr:.0f} bpm, "
+                f"{hr_delta:+.1f} bpm) on fresh-leg days."
+            ),
+        })
+
+    # Insight D: Combined Hybrid Load -> Daily Stress & Next-Day RHR
+    load_rhr = master[master["hybrid_load"] > 0].dropna(subset=["hybrid_load", "next_day_rhr_bpm"])
+    if len(load_rhr) >= 6:
+        r_ld, n_ld = _pearson(load_rhr["hybrid_load"], load_rhr["next_day_rhr_bpm"])
+        q75 = float(load_rhr["hybrid_load"].quantile(0.75))
+        hi_rhr = float(load_rhr[load_rhr["hybrid_load"] >= q75]["next_day_rhr_bpm"].mean())
+        lo_rhr = float(load_rhr[load_rhr["hybrid_load"] < q75]["next_day_rhr_bpm"].mean())
+        insights.append({
+            "title": "High Hybrid Load (Garmin + Hevy) → Next-Day RHR Strain",
+            "category": "Hybrid Load × RHR",
+            "icon": "recovery",
+            "accent": "#58a6ff",
+            "r": r_ld,
+            "n": n_ld,
+            "metric": f"{hi_rhr - lo_rhr:+.1f} bpm",
+            "summary": (
+                f"Top-quartile training days (hybrid load ≥{q75:.0f}) are followed by an average RHR of "
+                f"<b>{hi_rhr:.1f} bpm</b> the next morning vs. <b>{lo_rhr:.1f} bpm</b> after lighter days (r = {r_ld:+.2f})."
+            ),
+        })
+
+    # Insight E: Daily Steps / Movement -> Nightly Deep Sleep %
+    st_sl = master.dropna(subset=["steps", "tonight_deep_pct"])
+    if len(st_sl) >= 6:
+        r_st, n_st = _pearson(st_sl["steps"], st_sl["tonight_deep_pct"])
+        active_d = st_sl[st_sl["steps"] >= 8500]
+        sed_d = st_sl[st_sl["steps"] < 8500]
+        if len(active_d) >= 2 and len(sed_d) >= 2:
+            act_deep = float(active_d["tonight_deep_pct"].mean())
+            sed_deep = float(sed_d["tonight_deep_pct"].mean())
+            insights.append({
+                "title": "Active Movement (≥8,500 Steps) → Nightly Deep Sleep Share",
+                "category": "Walking × Sleep",
+                "icon": "walking",
+                "accent": "#39d353",
+                "r": r_st,
+                "n": n_st,
+                "metric": f"{act_deep - sed_deep:+.1f}% Deep",
+                "summary": (
+                    f"Days with ≥8,500 steps are followed by <b>{act_deep:.1f}% Deep Sleep</b> "
+                    f"that night compared to <b>{sed_deep:.1f}%</b> on lower-movement days."
+                ),
+            })
+
+    # Insight F: Morning Body Battery -> Hevy Lifting Tonnage
+    lift_rec = master[master["lift_volume_kg"] > 0].dropna(subset=["body_battery", "lift_volume_kg"])
+    if len(lift_rec) >= 5:
+        r_bb, n_bb = _pearson(lift_rec["body_battery"], lift_rec["lift_volume_kg"])
+        med_bb = float(lift_rec["body_battery"].median())
+        hi_vol = float(lift_rec[lift_rec["body_battery"] >= med_bb]["lift_volume_kg"].mean())
+        lo_vol = float(lift_rec[lift_rec["body_battery"] < med_bb]["lift_volume_kg"].mean())
+        vol_pct = ((hi_vol - lo_vol) / max(1.0, lo_vol)) * 100.0
+        insights.append({
+            "title": "Morning Body Battery Charge → Hevy Lifting Tonnage",
+            "category": "Recovery × Strength",
+            "icon": "calories",
+            "accent": "#e3b341",
+            "r": r_bb,
+            "n": n_bb,
+            "metric": f"{vol_pct:+.1f}% tonnage",
+            "summary": (
+                f"When starting the day with Body Battery ≥{med_bb:.0f}, your gym sessions average "
+                f"<b>{hi_vol:,.0f} kg</b> total volume vs. <b>{lo_vol:,.0f} kg</b> when depleted ({vol_pct:+.1f}%)."
+            ),
+        })
+
+    # 5. Correlation Matrix across core daily telemetry metrics
+    corr_cols = {
+        "garmin_load": "Cardio Load",
+        "run_eff": "Run Efficiency (m/beat)",
+        "lift_volume_kg": "Lifting Tonnage (kg)",
+        "steps": "Daily Steps",
+        "sleep_h": "Sleep Duration (h)",
+        "sleep_score": "Sleep Score",
+        "deep_pct": "Deep Sleep %",
+        "hrv_ms": "Nightly HRV (ms)",
+        "rhr_bpm": "Resting HR (bpm)",
+        "body_battery": "Body Battery Peak",
+        "stress": "Daily Stress",
+    }
+    avail_cols = [c for c in corr_cols if c in master.columns and master[c].notna().sum() >= 5 and master[c].std() > 0]
+    corr_matrix = master[avail_cols].rename(columns=corr_cols).corr().round(2) if len(avail_cols) >= 3 else pd.DataFrame()
+
+    return {
+        "master": master,
+        "insights": insights,
+        "corr_matrix": corr_matrix,
+        "corr_labels": corr_cols,
+    }
