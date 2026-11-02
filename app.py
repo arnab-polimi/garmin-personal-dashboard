@@ -1,4 +1,5 @@
 import base64
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import data
+
+# Ensure `data` module is hot-reloaded on Streamlit Cloud when data.py is updated in-place
+_data_mtime = Path(data.__file__).stat().st_mtime if getattr(data, "__file__", None) else None
+if getattr(data, "_LOADED_MTIME", None) != _data_mtime or not hasattr(data, "compute_correlations_and_insights"):
+    data = importlib.reload(data)
+    data._LOADED_MTIME = _data_mtime
 
 ICONS_DIR = Path(__file__).resolve().parent / "icons"
 

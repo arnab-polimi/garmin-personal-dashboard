@@ -1290,15 +1290,21 @@ def compute_correlations_and_insights(
     master = pd.DataFrame({"day": idx})
 
     # 1. Garmin Activities aggregation by day
-    if not acts.empty and acts["date"].notna().any():
+    if not acts.empty and "date" in acts.columns and acts["date"].notna().any():
         ac = acts.copy()
-        ac["day"] = pd.to_datetime(ac["date"]).dt.normalize()
+        ac["date"] = pd.to_datetime(ac["date"], errors="coerce")
+        ac = ac.dropna(subset=["date"])
+        ac["day"] = ac["date"].dt.tz_localize(None).dt.normalize() if ac["date"].dt.tz is not None else ac["date"].dt.normalize()
+        for num_c in ["distance_km", "duration_min", "avg_hr", "max_hr", "avg_speed_kmh", "eff_speed_mps", "training_effect", "anaerobic_te", "training_load"]:
+            if num_c in ac.columns:
+                ac[num_c] = pd.to_numeric(ac[num_c], errors="coerce")
         ac["load_est"] = ac.apply(_estimate_activity_load, axis=1)
-        ac["start_hour"] = pd.to_datetime(ac["date"]).dt.hour + pd.to_datetime(ac["date"]).dt.minute / 60.0
+        ac["start_hour"] = ac["date"].dt.hour + ac["date"].dt.minute / 60.0
         eff_mps = ac["eff_speed_mps"] if "eff_speed_mps" in ac.columns else (ac["avg_speed_kmh"] / 3.6)
+        valid_run = (ac["category"] == "Run") & (ac["avg_hr"].notna()) & (ac["avg_hr"] > 95) & (ac["distance_km"] >= 2.0)
         ac["eff_m_per_beat"] = np.where(
-            (ac["category"] == "Run") & (ac["avg_hr"].notna()) & (ac["avg_hr"] > 95) & (ac["distance_km"] >= 2.0),
-            (eff_mps * 60.0) / ac["avg_hr"],
+            valid_run,
+            (eff_mps * 60.0) / ac["avg_hr"].where(valid_run, np.nan),
             np.nan,
         )
 
@@ -1387,7 +1393,11 @@ def compute_correlations_and_insights(
     # 3. Sleep, HRV, Daily Summary
     if not sleep.empty and "date" in sleep.columns:
         sl = sleep.copy()
-        sl["day"] = pd.to_datetime(sl["date"]).dt.normalize()
+        sl["day"] = pd.to_datetime(sl["date"], errors="coerce").dt.normalize()
+        sl = sl.dropna(subset=["day"]).drop_duplicates("day", keep="last")
+        for sc in ["total_h", "deep_h", "rem_h", "awake_h", "score"]:
+            if sc in sl.columns:
+                sl[sc] = pd.to_numeric(sl[sc], errors="coerce")
         sl["deep_pct"] = np.where(sl["total_h"] > 0, (sl["deep_h"] / sl["total_h"]) * 100.0, np.nan)
         sl["rem_pct"] = np.where(sl["total_h"] > 0, (sl["rem_h"] / sl["total_h"]) * 100.0, np.nan)
         sl_keep = sl[["day", "total_h", "deep_h", "rem_h", "awake_h", "score", "deep_pct", "rem_pct"]].rename(
@@ -1403,14 +1413,20 @@ def compute_correlations_and_insights(
 
     if not hrv.empty and "date" in hrv.columns:
         hv = hrv.copy()
-        hv["day"] = pd.to_datetime(hv["date"]).dt.normalize()
+        hv["day"] = pd.to_datetime(hv["date"], errors="coerce").dt.normalize()
+        hv = hv.dropna(subset=["day"]).drop_duplicates("day", keep="last")
+        hv["hrv"] = pd.to_numeric(hv["hrv"], errors="coerce")
         master = master.merge(hv[["day", "hrv"]].rename(columns={"hrv": "hrv_ms"}), on="day", how="left")
     else:
         master["hrv_ms"] = np.nan
 
     if not daily.empty and "date" in daily.columns:
         dl = daily.copy()
-        dl["day"] = pd.to_datetime(dl["date"]).dt.normalize()
+        dl["day"] = pd.to_datetime(dl["date"], errors="coerce").dt.normalize()
+        dl = dl.dropna(subset=["day"]).drop_duplicates("day", keep="last")
+        for dc in ["steps", "resting_hr", "body_battery_high", "stress"]:
+            if dc in dl.columns:
+                dl[dc] = pd.to_numeric(dl[dc], errors="coerce")
         master = master.merge(
             dl[["day", "steps", "resting_hr", "body_battery_high", "stress"]].rename(
                 columns={"resting_hr": "rhr_bpm", "body_battery_high": "body_battery"}
@@ -1421,6 +1437,10 @@ def compute_correlations_and_insights(
     else:
         for col in ["steps", "rhr_bpm", "body_battery", "stress"]:
             master[col] = np.nan
+
+    for col in master.columns:
+        if col not in ("day", "is_leg_day", "post_leg_24_48h"):
+            master[col] = pd.to_numeric(master[col], errors="coerce")
 
     # Tonight's recovery metrics (stamped on `day + 1` morning) to measure how today's training affects tonight's recovery
     master["tonight_sleep_h"] = master["sleep_h"].shift(-1)
