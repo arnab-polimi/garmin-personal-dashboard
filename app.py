@@ -1325,7 +1325,8 @@ with tabs[6]:
         "#39d353" if ts["load_status"] == "Optimal" else "#e3b341",
     )
     vo2_delta = f"{vo2.vo2max.iloc[-1] - vo2.vo2max.iloc[0]:+.1f} vs start" if len(vo2) > 1 else "Latest estimate"
-    kpi_card(c[2], "VO₂max", f"{vo2.vo2max.iloc[-1]:.1f}" if len(vo2) else "–", vo2_delta, "running", "#f78166")
+    vo2_sub = f"{vo2.vo2max.iloc[-1]:.1f} mL/kg · {vo2_delta}" if len(vo2) else vo2_delta
+    kpi_card(c[2], "VO₂max", f"{vo2.vo2max.iloc[-1]:.0f}" if len(vo2) else "–", vo2_sub, "running", "#f78166")
     kpi_card(
         c[3],
         "HRV (Last Night)",

@@ -68,6 +68,9 @@ def _predict_races_from_vo2(vo2: float | None, acts: pd.DataFrame) -> dict:
             vdot = float(vo2)
         else:
             return {}
+    elif vo2 and not pd.isna(vo2) and float(vo2) > vdot:
+        # When most runs are submaximal/easy training runs, use VO2max as the primary aerobic ceiling
+        vdot = float(vo2) * 0.96 + vdot * 0.04
     vo2 = vdot
 
     preds = {}
@@ -174,9 +177,28 @@ def _parse_activities(raw_list: list) -> pd.DataFrame:
             type_key = str(act_type or "other")
         dist_m = a.get("distance") or (a.get("summaryDTO") or {}).get("distance") or 0
         dur_s = a.get("duration") or a.get("movingDuration") or (a.get("summaryDTO") or {}).get("duration") or 0
+        mov_s = a.get("movingDuration") or (a.get("summaryDTO") or {}).get("movingDuration") or dur_s
         avg_spd = a.get("averageSpeed") or (a.get("summaryDTO") or {}).get("averageSpeed")
         if not avg_spd and dist_m and dur_s:
             avg_spd = dist_m / dur_s
+
+        # Effective running speed (excluding standing/walking pauses and accounting for active interval work bouts)
+        splits = a.get("splitSummaries") or []
+        rwd_run = next((s for s in splits if isinstance(s, dict) and s.get("splitType") == "RWD_RUN"), None)
+        int_act = next((s for s in splits if isinstance(s, dict) and s.get("splitType") == "INTERVAL_ACTIVE"), None)
+        has_rest_splits = any(
+            isinstance(s, dict) and s.get("splitType") in ("INTERVAL_WARMUP", "INTERVAL_RECOVERY", "INTERVAL_COOLDOWN")
+            for s in splits
+        )
+        spd_mov = (float(dist_m) / float(mov_s)) if (dist_m and mov_s and float(mov_s) > 0) else float(avg_spd or 0)
+        spd_rwd = float(rwd_run.get("averageSpeed") or 0) if rwd_run else 0.0
+        spd_gap = float(a.get("avgGradeAdjustedSpeed") or (a.get("summaryDTO") or {}).get("avgGradeAdjustedSpeed") or 0)
+        eff_spd = max(float(avg_spd or 0), spd_mov, spd_rwd, spd_gap)
+        if has_rest_splits and int_act and float(int_act.get("distance") or 0) >= 1500 and float(mov_s or 0) > 0:
+            spd_int = float(int_act.get("averageSpeed") or 0)
+            int_share = float(np.clip(float(int_act.get("duration") or 0) / float(mov_s), 0.25, 0.85))
+            eff_spd = eff_spd * (1.0 - 0.35 * int_share) + spd_int * (0.35 * int_share)
+
         rows.append({
             "id": a.get("activityId") or a.get("id"),
             "date": pd.to_datetime(
@@ -193,6 +215,7 @@ def _parse_activities(raw_list: list) -> pd.DataFrame:
             "calories": a.get("calories") or (a.get("summaryDTO") or {}).get("calories"),
             "elevation_m": a.get("elevationGain") or (a.get("summaryDTO") or {}).get("elevationGain") or 0,
             "avg_speed_kmh": float(avg_spd or 0) * 3.6,
+            "eff_speed_mps": eff_spd,
             "vo2max": a.get("vO2MaxValue") or (a.get("summaryDTO") or {}).get("vO2MaxValue"),
             "training_effect": a.get("aerobicTrainingEffect") or (a.get("summaryDTO") or {}).get("aerobicTrainingEffect"),
             "anaerobic_te": a.get("anaerobicTrainingEffect") or (a.get("summaryDTO") or {}).get("anaerobicTrainingEffect"),
@@ -200,7 +223,7 @@ def _parse_activities(raw_list: list) -> pd.DataFrame:
         })
     cols = ["id", "date", "name", "type", "distance_km", "duration_min",
             "avg_hr", "max_hr", "calories", "elevation_m",
-            "avg_speed_kmh", "vo2max", "training_effect", "anaerobic_te", "training_load"]
+            "avg_speed_kmh", "eff_speed_mps", "vo2max", "training_effect", "anaerobic_te", "training_load"]
     df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     df["category"] = df["type"].map(category)
     return df
@@ -460,7 +483,8 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
             break
         offset += page_size
 
-    acts = _parse_activities(raw_acts)
+    all_acts = _parse_activities(raw_acts)
+    acts = all_acts.copy()
     if not acts.empty and acts["date"].notna().any():
         acts = acts[acts["date"].dt.date >= start].reset_index(drop=True)
 
@@ -582,21 +606,23 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
         columns=["date", "steps", "resting_hr", "body_battery_high", "stress"]
     )
 
-    # 3. VO2max: use activity vO2MaxValue when present, otherwise estimate from running speed & HR reserve (ACSM)
+    # 3. VO2max: use activity vO2MaxValue when present, otherwise estimate from running speed & HR reserve (Firstbeat/ACSM)
     vo2_points = {}
     if not acts.empty and "vo2max" in acts.columns:
         for _, r in acts.dropna(subset=["vo2max", "date"]).iterrows():
             if r["vo2max"] and r["vo2max"] > 0:
                 vo2_points[r["date"].date().isoformat()] = float(r["vo2max"])
 
-    if not vo2_points and not acts.empty:
-        runs = acts[(acts["category"] == "Run") & (acts["distance_km"] >= 2.5) & (acts["duration_min"] >= 12)].sort_values("date")
+    if not vo2_points and not all_acts.empty:
+        runs = all_acts[(all_acts["category"] == "Run") & (all_acts["distance_km"] >= 2.5) & (all_acts["duration_min"] >= 12)].sort_values("date")
         if not runs.empty:
-            rhr = float(daily_df["resting_hr"].median()) if not daily_df.empty and daily_df["resting_hr"].notna().any() else 55.0
-            mhr = max(188.0, float(runs["max_hr"].max()) if runs["max_hr"].notna().any() else 190.0)
+            recent_rhr = daily_df.tail(28)["resting_hr"].dropna() if not daily_df.empty and "resting_hr" in daily_df.columns else pd.Series(dtype=float)
+            rhr = float(recent_rhr.median()) if not recent_rhr.empty else 53.0
+            mhr = max(195.0, float(all_acts["max_hr"].max()) if all_acts["max_hr"].notna().any() else 195.0)
             est_rows = []
             for _, r in runs.iterrows():
-                v = (r["distance_km"] * 1000.0) / r["duration_min"]  # m/min
+                eff_mps = float(r.get("eff_speed_mps") or 0.0)
+                v = eff_mps * 60.0 if eff_mps > 0 else (r["distance_km"] * 1000.0) / r["duration_min"]  # m/min
                 grade = max(0.0, min(0.10, float(r["elevation_m"] or 0) / (r["distance_km"] * 1000.0)))
                 vo2_net = 0.2 * v + 0.9 * v * grade
                 if pd.notna(r["avg_hr"]) and float(r["avg_hr"]) > rhr + 25:
@@ -606,8 +632,19 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
                     est = vo2_net / 0.80 + 3.5
                 est_rows.append({"date": pd.Timestamp(r["date"].date()), "vo2max": float(np.clip(est, 25.0, 80.0))})
             if est_rows:
-                vdf = pd.DataFrame(est_rows).groupby("date", as_index=False)["vo2max"].mean().sort_values("date")
-                vdf["vo2max"] = vdf["vo2max"].rolling(4, min_periods=1).mean().round(1)
+                vdf = pd.DataFrame(est_rows).groupby("date", as_index=False)["vo2max"].max().sort_values("date")
+                vdf = vdf.set_index("date")
+                # Firstbeat 28-day rolling aerobic ceiling (85th percentile) + 3-run smoothing
+                vdf["vo2max"] = (
+                    vdf["vo2max"]
+                    .rolling("28D", min_periods=1)
+                    .quantile(0.85)
+                    .rolling(3, min_periods=1)
+                    .mean()
+                    .round(1)
+                )
+                vdf = vdf.reset_index()
+                vdf = vdf[vdf["date"].dt.date >= start].reset_index(drop=True)
                 vo2_df = vdf
             else:
                 vo2_df = pd.DataFrame(columns=["date", "vo2max"])
