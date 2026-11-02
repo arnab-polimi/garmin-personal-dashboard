@@ -769,3 +769,456 @@ def demo(days: int) -> dict:
     return {"activities": acts, "sleep": sleep, "hrv": hrv, "daily": daily, "vo2max": vo2,
             "predictions": {"5K": 1215, "10K": 2540, "Half marathon": 5610, "Marathon": 11830},
             "training_status": training_status}
+
+
+# =========================================================
+# 4. OFFICIAL HEVY API CLIENT (https://api.hevyapp.com/v1)
+# =========================================================
+HEVY_BASE_URL = "https://api.hevyapp.com"
+
+
+def _infer_muscle_group(title: str) -> str:
+    t = (title or "").lower()
+    if any(k in t for k in ["bench", "chest", "pec", "fly", "push up", "push-up", "dip"]):
+        return "Chest"
+    if any(k in t for k in ["lat", "pull up", "pull-up", "chin up", "pulldown", "row", "back", "shrug", "face pull", "rear delt"]):
+        return "Back"
+    if any(k in t for k in ["squat", "leg press", "leg extension", "lunge", "split squat", "hack", "quad"]):
+        return "Quadriceps"
+    if any(k in t for k in ["deadlift", "rdl", "romanian", "hamstring", "leg curl", "good morning", "hip thrust", "glute"]):
+        return "Hamstrings & Glutes"
+    if any(k in t for k in ["shoulder", "overhead", "military", "lateral raise", "arnold", "ohp", "front raise"]):
+        return "Shoulders"
+    if any(k in t for k in ["bicep", "curl", "hammer", "preacher"]):
+        return "Biceps"
+    if any(k in t for k in ["tricep", "pushdown", "skullcrusher", "extension"]):
+        return "Triceps"
+    if any(k in t for k in ["calf", "calves"]):
+        return "Calves"
+    if any(k in t for k in ["ab", "crunch", "plank", "core", "leg raise", "sit up"]):
+        return "Core"
+    return "Full Body"
+
+
+def _format_muscle_label(raw_muscle: str | None, fallback_title: str = "") -> str:
+    if not raw_muscle:
+        return _infer_muscle_group(fallback_title)
+    m = str(raw_muscle).lower().strip()
+    mapping = {
+        "chest": "Chest",
+        "lats": "Back",
+        "upper_back": "Back",
+        "lower_back": "Back",
+        "traps": "Back",
+        "quadriceps": "Quadriceps",
+        "hamstrings": "Hamstrings & Glutes",
+        "glutes": "Hamstrings & Glutes",
+        "abductors": "Hamstrings & Glutes",
+        "adductors": "Quadriceps",
+        "shoulders": "Shoulders",
+        "biceps": "Biceps",
+        "triceps": "Triceps",
+        "forearms": "Arms",
+        "calves": "Calves",
+        "abdominals": "Core",
+        "full_body": "Full Body",
+        "cardio": "Cardio",
+    }
+    return mapping.get(m, m.replace("_", " ").title())
+
+
+class HevyAPIClient:
+    """Official Hevy Public API v1 client (https://api.hevyapp.com/v1)."""
+
+    def __init__(self, api_key: str):
+        self.api_key = (api_key or "").strip()
+        if not self.api_key:
+            raise ValueError("Missing Hevy API Key.")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "api-key": self.api_key,
+            "Accept": "application/json",
+        })
+
+    def get(self, path: str, params: dict | None = None):
+        url = path if path.startswith("http") else f"{HEVY_BASE_URL}{path}"
+        resp = self.session.get(url, params=params, timeout=25)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Hevy API request failed ({path} -> HTTP {resp.status_code}): {resp.text[:250]}")
+        return resp.json() if resp.content else {}
+
+
+def _parse_hevy_workouts(raw_workouts: list, templates_map: dict, start_date: date | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    workout_rows = []
+    set_rows = []
+
+    for w in raw_workouts or []:
+        if not isinstance(w, dict):
+            continue
+        w_id = w.get("id")
+        w_title = w.get("title") or "Strength Workout"
+        start_ts = pd.to_datetime(w.get("start_time"), utc=True, errors="coerce")
+        end_ts = pd.to_datetime(w.get("end_time"), utc=True, errors="coerce")
+        if pd.isna(start_ts):
+            continue
+        start_local = start_ts.tz_convert(None)
+        end_local = end_ts.tz_convert(None) if pd.notna(end_ts) else start_local
+        if start_date and start_local.date() < start_date:
+            continue
+
+        dur_min = max(0.0, (end_local - start_local).total_seconds() / 60.0)
+        exercises = w.get("exercises") or []
+
+        w_sets = 0
+        w_working_sets = 0
+        w_reps = 0
+        w_vol = 0.0
+        w_max_weight = 0.0
+        w_rpes = []
+        w_muscles = []
+
+        for ex_idx, ex in enumerate(exercises):
+            if not isinstance(ex, dict):
+                continue
+            ex_title = ex.get("title") or "Exercise"
+            tpl_id = str(ex.get("exercise_template_id") or "")
+            tpl = templates_map.get(tpl_id) or {}
+            muscle = _format_muscle_label(tpl.get("primary_muscle_group"), ex_title)
+            equip = str(tpl.get("equipment") or "other").replace("_", " ").title()
+            w_muscles.append(muscle)
+
+            for s_idx, s in enumerate(ex.get("sets") or []):
+                if not isinstance(s, dict):
+                    continue
+                s_type = str(s.get("type") or "normal").lower()
+                wt = float(s.get("weight_kg") or 0.0) if s.get("weight_kg") is not None else 0.0
+                reps = int(s.get("reps") or 0) if s.get("reps") is not None else 0
+                rpe = float(s.get("rpe")) if s.get("rpe") is not None else np.nan
+                dist_m = float(s.get("distance_meters") or 0.0) if s.get("distance_meters") is not None else 0.0
+                dur_s = float(s.get("duration_seconds") or 0.0) if s.get("duration_seconds") is not None else 0.0
+                vol = wt * reps if wt > 0 and reps > 0 else 0.0
+                # Epley 1RM estimate for working sets with <= 20 reps
+                e1rm = round(wt * (1.0 + min(reps, 30) / 30.0), 1) if (wt > 0 and reps > 0 and s_type != "warmup") else 0.0
+
+                w_sets += 1
+                if s_type != "warmup":
+                    w_working_sets += 1
+                    w_reps += reps
+                    w_vol += vol
+                    if wt > w_max_weight:
+                        w_max_weight = wt
+                    if pd.notna(rpe):
+                        w_rpes.append(rpe)
+
+                set_rows.append({
+                    "workout_id": w_id,
+                    "date": start_local,
+                    "day": start_local.normalize(),
+                    "workout_title": w_title,
+                    "exercise_index": ex.get("index", ex_idx),
+                    "exercise_title": ex_title,
+                    "exercise_template_id": tpl_id,
+                    "muscle_group": muscle,
+                    "equipment": equip,
+                    "set_index": (s.get("index", s_idx) or 0) + 1,
+                    "set_type": s_type,
+                    "weight_kg": wt,
+                    "reps": reps,
+                    "volume_kg": round(vol, 1),
+                    "e1rm_kg": e1rm,
+                    "rpe": rpe,
+                    "distance_meters": dist_m,
+                    "duration_seconds": dur_s,
+                    "notes": ex.get("notes") or "",
+                })
+
+        unique_muscles = list(dict.fromkeys(w_muscles))
+        workout_rows.append({
+            "id": w_id,
+            "date": start_local,
+            "end_time": end_local,
+            "day": start_local.normalize(),
+            "title": w_title,
+            "description": w.get("description") or "",
+            "routine_id": w.get("routine_id"),
+            "duration_min": round(dur_min, 1),
+            "exercises_count": len(exercises),
+            "total_sets": w_sets,
+            "working_sets": w_working_sets,
+            "total_reps": w_reps,
+            "volume_kg": round(w_vol, 1),
+            "max_weight_kg": round(w_max_weight, 1),
+            "avg_rpe": round(float(np.mean(w_rpes)), 1) if w_rpes else np.nan,
+            "primary_muscles": ", ".join(unique_muscles[:3]) if unique_muscles else "Full Body",
+        })
+
+    w_cols = [
+        "id", "date", "end_time", "day", "title", "description", "routine_id",
+        "duration_min", "exercises_count", "total_sets", "working_sets",
+        "total_reps", "volume_kg", "max_weight_kg", "avg_rpe", "primary_muscles",
+    ]
+    s_cols = [
+        "workout_id", "date", "day", "workout_title", "exercise_index", "exercise_title",
+        "exercise_template_id", "muscle_group", "equipment", "set_index", "set_type",
+        "weight_kg", "reps", "volume_kg", "e1rm_kg", "rpe", "distance_meters", "duration_seconds", "notes",
+    ]
+    w_df = pd.DataFrame(workout_rows, columns=w_cols).sort_values("date", ascending=False).reset_index(drop=True) if workout_rows else pd.DataFrame(columns=w_cols)
+    s_df = pd.DataFrame(set_rows, columns=s_cols).sort_values(["date", "exercise_index", "set_index"], ascending=[False, True, True]).reset_index(drop=True) if set_rows else pd.DataFrame(columns=s_cols)
+    return w_df, s_df
+
+
+def fetch_hevy(client: HevyAPIClient, days: int) -> dict:
+    """Fetch workouts, exercise templates, routines, and body measurements from Hevy API v1."""
+    end = date.today()
+    start = end - timedelta(days=days)
+
+    # 1. Exercise templates (pageSize max = 100)
+    templates_map = {}
+    first_tpl = _safe(client.get, "/v1/exercise_templates", params={"page": 1, "pageSize": 100}, default={}) or {}
+    for t in first_tpl.get("exercise_templates") or []:
+        if isinstance(t, dict) and t.get("id"):
+            templates_map[str(t["id"])] = t
+    tpl_pages = min(int(first_tpl.get("page_count") or 1), 10)
+    if tpl_pages > 1:
+        def _fetch_tpl_page(p):
+            return _safe(client.get, "/v1/exercise_templates", params={"page": p, "pageSize": 100}, default={}) or {}
+        with ThreadPoolExecutor(min(4, tpl_pages - 1)) as ex:
+            for res in ex.map(_fetch_tpl_page, range(2, tpl_pages + 1)):
+                for t in res.get("exercise_templates") or []:
+                    if isinstance(t, dict) and t.get("id"):
+                        templates_map[str(t["id"])] = t
+
+    # 2. Workouts (pageSize max = 10, newest first)
+    raw_workouts = []
+    first_w = client.get("/v1/workouts", params={"page": 1, "pageSize": 10}) or {}
+    batch = first_w.get("workouts") or []
+    raw_workouts.extend(batch)
+    w_pages = min(int(first_w.get("page_count") or 1), 60)
+
+    def _oldest_is_after_start(items: list) -> bool:
+        if not items:
+            return False
+        oldest_str = items[-1].get("start_time")
+        ts = pd.to_datetime(oldest_str, utc=True, errors="coerce")
+        return pd.notna(ts) and ts.tz_convert(None).date() >= start
+
+    page = 2
+    while page <= w_pages and _oldest_is_after_start(batch):
+        # Fetch up to 4 pages in parallel per step
+        end_p = min(w_pages, page + 3)
+        pages_to_get = list(range(page, end_p + 1))
+        with ThreadPoolExecutor(len(pages_to_get)) as ex:
+            results = list(ex.map(
+                lambda p: _safe(client.get, "/v1/workouts", params={"page": p, "pageSize": 10}, default={}) or {},
+                pages_to_get,
+            ))
+        stop = False
+        for r in results:
+            b = r.get("workouts") or []
+            if not b:
+                stop = True
+                break
+            raw_workouts.extend(b)
+            batch = b
+            if not _oldest_is_after_start(b):
+                stop = True
+                break
+        if stop:
+            break
+        page = end_p + 1
+
+    workouts_df, sets_df = _parse_hevy_workouts(raw_workouts, templates_map, start_date=start)
+
+    # 3. Routines (pageSize max = 10)
+    routines_raw = _safe(client.get, "/v1/routines", params={"page": 1, "pageSize": 10}, default={}) or {}
+    routine_rows = []
+    for rt in routines_raw.get("routines") or []:
+        if not isinstance(rt, dict):
+            continue
+        exs = rt.get("exercises") or []
+        ex_names = [e.get("title") or "Exercise" for e in exs if isinstance(e, dict)]
+        tot_sets = sum(len(e.get("sets") or []) for e in exs if isinstance(e, dict))
+        routine_rows.append({
+            "id": rt.get("id"),
+            "title": rt.get("title") or "Routine",
+            "exercises_count": len(exs),
+            "total_sets": tot_sets,
+            "exercises_summary": ", ".join(ex_names[:5]) + (f" +{len(ex_names) - 5} more" if len(ex_names) > 5 else ""),
+            "updated_at": pd.to_datetime(rt.get("updated_at"), utc=True, errors="coerce"),
+        })
+    routines_df = pd.DataFrame(routine_rows) if routine_rows else pd.DataFrame(
+        columns=["id", "title", "exercises_count", "total_sets", "exercises_summary", "updated_at"]
+    )
+
+    # 4. User info & Body Measurements (optional)
+    user_resp = _safe(client.get, "/v1/user/info", default={}) or {}
+    user_info = user_resp.get("data") if isinstance(user_resp, dict) else {}
+
+    bm_resp = _safe(client.get, "/v1/body_measurements", params={"page": 1, "pageSize": 10}, default={}) or {}
+    bm_list = bm_resp.get("body_measurements") if isinstance(bm_resp, dict) else []
+    bm_df = pd.DataFrame(bm_list) if bm_list else pd.DataFrame(columns=["date", "weight_kg", "lean_mass_kg", "fat_percent"])
+    if not bm_df.empty and "date" in bm_df.columns:
+        bm_df["date"] = pd.to_datetime(bm_df["date"], errors="coerce")
+        bm_df = bm_df.sort_values("date").reset_index(drop=True)
+
+    return {
+        "workouts": workouts_df,
+        "sets": sets_df,
+        "routines": routines_df,
+        "measurements": bm_df,
+        "user": user_info or {},
+    }
+
+
+def demo_hevy(days: int) -> dict:
+    """Generate realistic synthetic Hevy weightlifting workouts, sets, routines, and PR progressions."""
+    rng = np.random.default_rng(108)
+    end = pd.Timestamp(date.today())
+    idx = pd.date_range(end - pd.Timedelta(days=days), end)
+
+    SPLITS = [
+        (
+            "Push Hypertrophy & Strength",
+            [
+                ("Bench Press (Barbell)", "TPL_BENCH", "Chest", "Barbell", 77.5, 0.08, [(8, 8.0), (8, 8.5), (6, 9.0), (6, 9.5)]),
+                ("Incline Bench Press (Dumbbell)", "TPL_INC_DB", "Chest", "Dumbbell", 30.0, 0.04, [(10, 8.0), (10, 8.5), (9, 9.0)]),
+                ("Overhead Press (Barbell)", "TPL_OHP", "Shoulders", "Barbell", 47.5, 0.05, [(8, 8.0), (8, 8.5), (6, 9.0)]),
+                ("Lateral Raise (Dumbbell)", "TPL_LAT_RAISE", "Shoulders", "Dumbbell", 12.0, 0.02, [(15, 8.5), (14, 9.0), (12, 9.5)]),
+                ("Triceps Pushdown (Cable)", "TPL_TRI_PUSH", "Triceps", "Machine", 27.5, 0.03, [(12, 8.0), (12, 8.5), (10, 9.0)]),
+            ],
+        ),
+        (
+            "Pull Day (Back & Biceps)",
+            [
+                ("Deadlift (Barbell)", "TPL_DL", "Hamstrings & Glutes", "Barbell", 130.0, 0.14, [(5, 8.0), (5, 8.5), (3, 9.0)]),
+                ("Lat Pulldown (Cable)", "TPL_LAT_PD", "Back", "Machine", 65.0, 0.06, [(10, 8.0), (10, 8.5), (8, 9.0)]),
+                ("Bent Over Row (Barbell)", "TPL_ROW", "Back", "Barbell", 72.5, 0.07, [(8, 8.0), (8, 8.5), (8, 9.0)]),
+                ("Seated Cable Row", "TPL_CABLE_ROW", "Back", "Machine", 60.0, 0.05, [(12, 8.0), (10, 8.5), (10, 9.0)]),
+                ("Bicep Curl (Dumbbell)", "TPL_DB_CURL", "Biceps", "Dumbbell", 16.0, 0.02, [(12, 8.5), (10, 9.0), (10, 9.5)]),
+            ],
+        ),
+        (
+            "Legs & Posterior Chain",
+            [
+                ("Squat (Barbell)", "TPL_SQUAT", "Quadriceps", "Barbell", 105.0, 0.12, [(6, 8.0), (6, 8.5), (5, 9.0), (5, 9.5)]),
+                ("Romanian Deadlift (Barbell)", "TPL_RDL", "Hamstrings & Glutes", "Barbell", 95.0, 0.10, [(8, 8.0), (8, 8.5), (8, 9.0)]),
+                ("Leg Press (Machine)", "TPL_LEG_PRESS", "Quadriceps", "Machine", 180.0, 0.18, [(12, 8.0), (10, 8.5), (10, 9.0)]),
+                ("Seated Leg Curl (Machine)", "TPL_LEG_CURL", "Hamstrings & Glutes", "Machine", 55.0, 0.05, [(12, 8.5), (12, 9.0), (10, 9.5)]),
+                ("Standing Calf Raise", "TPL_CALF", "Calves", "Machine", 70.0, 0.06, [(15, 8.5), (15, 9.0), (12, 9.5)]),
+            ],
+        ),
+    ]
+
+    workout_rows = []
+    set_rows = []
+    split_counter = 0
+
+    for i, d in enumerate(idx):
+        # Roughly 3-4 lifting sessions per week
+        dow = d.weekday()
+        p_lift = 0.62 if dow in (0, 2, 4, 5) else 0.18
+        if rng.random() >= p_lift:
+            continue
+
+        title, exercises = SPLITS[split_counter % len(SPLITS)]
+        split_counter += 1
+        start_local = d + pd.Timedelta(hours=int(rng.integers(16, 20)), minutes=int(rng.choice([0, 15, 30, 45])))
+        dur_min = round(float(rng.normal(62, 8)), 1)
+        end_local = start_local + pd.Timedelta(minutes=dur_min)
+        w_id = f"demo-hevy-{i}"
+
+        w_sets = 0
+        w_working_sets = 0
+        w_reps = 0
+        w_vol = 0.0
+        w_max_weight = 0.0
+        w_rpes = []
+        w_muscles = []
+
+        for ex_idx, (ex_title, tpl_id, muscle, equip, base_wt, prog_rate, set_scheme) in enumerate(exercises):
+            w_muscles.append(muscle)
+            # Progressive overload across days + slight daily variance
+            prog_wt = base_wt + round((i * prog_rate) / 2.5) * 2.5
+            warmup_wt = round((prog_wt * 0.6) / 2.5) * 2.5
+
+            # 1 warmup set on first two compound lifts
+            all_sets = ([("warmup", warmup_wt, 10, np.nan)] if ex_idx < 2 else []) + [
+                ("normal", prog_wt, max(1, int(r + rng.integers(-1, 2))), rpe)
+                for r, rpe in set_scheme
+            ]
+
+            for s_idx, (s_type, wt, reps, rpe) in enumerate(all_sets, start=1):
+                vol = wt * reps
+                e1rm = round(wt * (1.0 + min(reps, 30) / 30.0), 1) if s_type != "warmup" else 0.0
+                w_sets += 1
+                if s_type != "warmup":
+                    w_working_sets += 1
+                    w_reps += reps
+                    w_vol += vol
+                    w_max_weight = max(w_max_weight, wt)
+                    if pd.notna(rpe):
+                        w_rpes.append(rpe)
+
+                set_rows.append({
+                    "workout_id": w_id,
+                    "date": start_local,
+                    "day": d.normalize(),
+                    "workout_title": title,
+                    "exercise_index": ex_idx,
+                    "exercise_title": ex_title,
+                    "exercise_template_id": tpl_id,
+                    "muscle_group": muscle,
+                    "equipment": equip,
+                    "set_index": s_idx,
+                    "set_type": s_type,
+                    "weight_kg": float(wt),
+                    "reps": int(reps),
+                    "volume_kg": round(float(vol), 1),
+                    "e1rm_kg": float(e1rm),
+                    "rpe": rpe,
+                    "distance_meters": 0.0,
+                    "duration_seconds": 0.0,
+                    "notes": "",
+                })
+
+        workout_rows.append({
+            "id": w_id,
+            "date": start_local,
+            "end_time": end_local,
+            "day": d.normalize(),
+            "title": title,
+            "description": "Logged via Hevy",
+            "routine_id": f"rt-{split_counter % len(SPLITS)}",
+            "duration_min": dur_min,
+            "exercises_count": len(exercises),
+            "total_sets": w_sets,
+            "working_sets": w_working_sets,
+            "total_reps": w_reps,
+            "volume_kg": round(w_vol, 1),
+            "max_weight_kg": round(w_max_weight, 1),
+            "avg_rpe": round(float(np.mean(w_rpes)), 1) if w_rpes else np.nan,
+            "primary_muscles": ", ".join(dict.fromkeys(w_muscles)),
+        })
+
+    routines_df = pd.DataFrame([
+        {
+            "id": f"rt-{i}",
+            "title": name,
+            "exercises_count": len(exs),
+            "total_sets": sum(len(s[6]) for s in exs),
+            "exercises_summary": ", ".join(e[0] for e in exs),
+            "updated_at": end - pd.Timedelta(days=14),
+        }
+        for i, (name, exs) in enumerate(SPLITS)
+    ])
+
+    workouts_df = pd.DataFrame(workout_rows).sort_values("date", ascending=False).reset_index(drop=True)
+    sets_df = pd.DataFrame(set_rows).sort_values(["date", "exercise_index", "set_index"], ascending=[False, True, True]).reset_index(drop=True)
+    return {
+        "workouts": workouts_df,
+        "sets": sets_df,
+        "routines": routines_df,
+        "measurements": pd.DataFrame(columns=["date", "weight_kg", "lean_mass_kg", "fat_percent"]),
+        "user": {"username": "demo_lifter", "weight_unit": "kg", "is_pro": True},
+    }
+

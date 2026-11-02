@@ -1,0 +1,79 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # Runs every 6 hours at minute 23 to keep Streamlit Community Cloud awake
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  wake-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      APP_URL: ${{ secrets.STREAMLIT_APP_URL || vars.STREAMLIT_APP_URL || 'https://garmin-personal-dashboard.streamlit.app' }}
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright & Chromium
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: Ping & Wake Streamlit App
+        run: |
+          python - << 'EOF'
+          import os
+          import sys
+          import time
+          import requests
+          from playwright.sync_api import sync_playwright
+
+          url = (os.environ.get("APP_URL") or "").strip().rstrip("/")
+          if not url:
+              print("No APP_URL configured; skipping.")
+              sys.exit(0)
+
+          print(f"Checking Streamlit app: {url}")
+          try:
+              r = requests.get(f"{url}/~/+/healthz", timeout=15)
+              print(f"Healthz status: {r.status_code}")
+          except Exception as e:
+              print(f"Healthz ping warning: {e}")
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(
+                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+              )
+              page = context.new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_timeout(5000)
+
+              # If Streamlit Community Cloud put the app to sleep, click the wake-up button
+              wake_selectors = [
+                  "button:has-text('Yes, get this app back up')",
+                  "[data-testid='wakeup-button-viewer']",
+                  "[data-testid='wakeup-button-owner']",
+              ]
+              for sel in wake_selectors:
+                  btn = page.locator(sel)
+                  if btn.count() > 0 and btn.first.is_visible():
+                      print(f"App was sleeping — clicking wake button ({sel})...")
+                      btn.first.click()
+                      page.wait_for_timeout(15000)
+                      break
+
+              # Wait for the Streamlit app container to render
+              try:
+                  page.wait_for_selector("[data-testid='stAppViewContainer'], .stApp", timeout=30000)
+                  print("Streamlit app is awake and rendered successfully!")
+              except Exception as e:
+                  print(f"Page loaded (title: {page.title()!r}), note: {e}")
+
+              browser.close()
+          EOF

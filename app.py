@@ -102,14 +102,16 @@ GH_SCALES = {
     "orange": ["#161b22", "#4a1e16", "#7d2d1e", "#c44b31", "#f78166"],
     "blue": ["#161b22", "#0c2d6b", "#1158c7", "#1f6feb", "#58a6ff"],
     "purple": ["#161b22", "#271846", "#4c2889", "#794bc4", "#a371f7"],
+    "amber": ["#161b22", "#3d2a0d", "#6e4b11", "#a87419", "#e3b341"],
 }
-COLORS = {"Run": "#f78166", "Cycling": "#58a6ff", "Walk": "#39d353", "Other": "#a371f7"}
+COLORS = {"Run": "#f78166", "Cycling": "#58a6ff", "Walk": "#39d353", "Strength": "#e3b341", "Other": "#a371f7"}
 
 TAB_SPECS = [
     ("Overview", "overview"),
     ("Running", "running"),
     ("Cycling", "bike"),
     ("Walking", "walking"),
+    ("Weightlifting", "strength"),
     ("Sleep", "sleep"),
     ("Recovery & Fitness", "recovery"),
     ("Race Predictions", "race_predictor"),
@@ -518,20 +520,32 @@ def load_legacy(email: str, password: str, tokens: str, days: int):
     return data.fetch_live(g, days)
 
 
+@st.cache_data(ttl=3600, show_spinner="Syncing Hevy API…")
+def load_hevy_api(api_key: str, days: int):
+    client = data.HevyAPIClient(api_key=api_key)
+    return data.fetch_hevy(client, days)
+
+
 try:
     cfg = dict(st.secrets["garmin"]) if "garmin" in st.secrets else {}
 except Exception:
     cfg = {}
 
+try:
+    hevy_cfg = dict(st.secrets["hevy"]) if "hevy" in st.secrets else {}
+except Exception:
+    hevy_cfg = {}
+
 secret_api_key = cfg.get("api_key", "")
 secret_access_token = cfg.get("access_token", "")
 has_legacy_secrets = bool(cfg.get("email") or cfg.get("tokens"))
+secret_hevy_key = hevy_cfg.get("api_key", "") or cfg.get("hevy_api_key", "")
 
 with st.sidebar:
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
         f'{icon_html("optimalhealth", size=22, bg="#26a64122", accent="#39d353", badge=True, mr=0)}'
-        f'<div><div style="font-weight:800;font-size:1.1rem;color:#f0f6fc;">Garmin Intelligence</div>'
+        f'<div><div style="font-weight:800;font-size:1.1rem;color:#f0f6fc;">Garmin + Hevy</div>'
         f'<div style="font-size:0.74rem;color:#8b949e;">Personal API Telemetry</div></div></div>',
         unsafe_allow_html=True,
     )
@@ -539,38 +553,73 @@ with st.sidebar:
     ui_api_key = ""
     if not secret_api_key and not secret_access_token:
         ui_api_key = st.text_input(
-            "Personal API Key",
+            "Garmin Personal API Key",
             type="password",
             placeholder="GCDC_...",
             help="Generate at Garmin Connect Web → Account Settings → Personal API Key (or set in .streamlit/secrets.toml)",
         ).strip()
+    ui_hevy_key = ""
+    if not secret_hevy_key:
+        ui_hevy_key = st.text_input(
+            "Hevy API Key",
+            type="password",
+            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            help="Generate at https://hevy.com/settings?developer (or set [hevy] api_key in .streamlit/secrets.toml)",
+        ).strip()
     active_api_key = secret_api_key or ui_api_key
+    active_hevy_key = secret_hevy_key or ui_hevy_key
     demo_mode = st.toggle(
         "Demo data",
-        value=not bool(active_api_key or secret_access_token or has_legacy_secrets),
-        help="Synthetic data, no API key needed.",
+        value=not bool(active_api_key or secret_access_token or has_legacy_secrets or active_hevy_key),
+        help="Synthetic data for Garmin & Hevy, no API key needed.",
     )
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
 
 try:
-    if demo_mode:
+    if demo_mode or not (active_api_key or secret_access_token or has_legacy_secrets):
         D = data.demo(days)
     elif active_api_key or secret_access_token:
         D = load_official_api(active_api_key, secret_access_token, days)
     elif has_legacy_secrets:
         D = load_legacy(cfg.get("email"), cfg.get("password"), cfg.get("tokens"), days)
-    else:
-        st.warning("Enter your Garmin Personal API Key in the sidebar or `.streamlit/secrets.toml`, or enable Demo data.")
-        st.stop()
 except Exception as e:
     st.error(f"Could not load Garmin data: {e}")
     st.info("Check your Personal API Key in `.streamlit/secrets.toml` (see `README.md`) or switch on Demo data in the sidebar.")
     st.stop()
 
+hevy_error = None
+try:
+    if demo_mode:
+        H = data.demo_hevy(days)
+    elif active_hevy_key:
+        H = load_hevy_api(active_hevy_key, days)
+    else:
+        H = {
+            "workouts": pd.DataFrame(),
+            "sets": pd.DataFrame(),
+            "routines": pd.DataFrame(),
+            "measurements": pd.DataFrame(),
+            "user": {},
+        }
+except Exception as e:
+    hevy_error = str(e)
+    H = {
+        "workouts": pd.DataFrame(),
+        "sets": pd.DataFrame(),
+        "routines": pd.DataFrame(),
+        "measurements": pd.DataFrame(),
+        "user": {},
+    }
+
 acts, sleep, hrv, daily, vo2, preds = (
     D[k] for k in ["activities", "sleep", "hrv", "daily", "vo2max", "predictions"]
 )
+hevy_workouts = H.get("workouts", pd.DataFrame())
+hevy_sets = H.get("sets", pd.DataFrame())
+hevy_routines = H.get("routines", pd.DataFrame())
+hevy_measurements = H.get("measurements", pd.DataFrame())
+
 ts = D.get("training_status") or data._compute_training_status(acts, vo2, hrv, daily, days)
 acts["day"] = pd.to_datetime(acts["date"]).dt.normalize()
 
@@ -590,8 +639,8 @@ with st.sidebar:
     if not acts.empty:
         latest_act = acts.sort_values("date", ascending=False).iloc[0]
         st.markdown(
-            f'<div style="background:#12171f;border:1px solid #21262d;border-radius:10px;padding:12px 14px;">'
-            f'<div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;margin-bottom:6px;">Latest Activity</div>'
+            f'<div style="background:#12171f;border:1px solid #21262d;border-radius:10px;padding:12px 14px;margin-bottom:10px;">'
+            f'<div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;margin-bottom:6px;">Latest Garmin Activity</div>'
             f'<div style="display:flex;align-items:center;gap:8px;font-weight:700;color:#f0f6fc;font-size:0.9rem;">'
             f'{icon_html(sport_icon_name(latest_act.type, latest_act.category), size=16, badge=False, mr=2)}{latest_act["name"]}</div>'
             f'<div style="font-size:0.78rem;color:#8b949e;margin-top:4px;">'
@@ -599,17 +648,39 @@ with st.sidebar:
             f'</div>',
             unsafe_allow_html=True,
         )
+    if not hevy_workouts.empty:
+        lw = hevy_workouts.iloc[0]
+        st.markdown(
+            f'<div style="background:#12171f;border:1px solid #e3b34144;border-radius:10px;padding:12px 14px;">'
+            f'<div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;margin-bottom:6px;">Latest Hevy Lift</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;font-weight:700;color:#f0f6fc;font-size:0.9rem;">'
+            f'{icon_html("strength", size=16, badge=False, mr=2)}{lw["title"]}</div>'
+            f'<div style="font-size:0.78rem;color:#8b949e;margin-top:4px;">'
+            f'{lw["volume_kg"]:,.0f} kg · {lw["working_sets"]} sets · {pd.to_datetime(lw["date"]):%d %b %H:%M}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 # --------------------------------------------------------------- Hero Banner
 status_cls = "status-pill demo" if demo_mode else "status-pill"
-status_txt = "Demo Mode · Synthetic Data" if demo_mode else "Connected · Official Garmin Personal API"
+if demo_mode:
+    status_txt = "Demo Mode · Garmin + Hevy Synthetic Data"
+elif active_hevy_key:
+    status_txt = "Connected · Garmin + Hevy APIs"
+else:
+    status_txt = "Connected · Official Garmin Personal API"
+hevy_sub = (
+    f" · {len(hevy_workouts)} lifts ({hevy_workouts.volume_kg.sum() / 1000:,.1f}t lifted)"
+    if not hevy_workouts.empty
+    else ""
+)
 st.markdown(
     f'<div class="hero-bar">'
     f'  <div class="hero-left">'
     f'    {icon_html("optimalhealth", size=28, bg="#26a64122", accent="#39d353", badge=True, mr=4)}'
     f'    <div>'
-    f'      <div class="hero-title">Personal Garmin Dashboard</div>'
-    f'      <div class="hero-sub">Last {days} days · {len(acts)} workouts · {acts.distance_km.sum():,.1f} km total volume</div>'
+    f'      <div class="hero-title">Personal Garmin & Hevy Dashboard</div>'
+    f'      <div class="hero-sub">Last {days} days · {len(acts)} cardio workouts ({acts.distance_km.sum():,.1f} km){hevy_sub}</div>'
     f'    </div>'
     f'  </div>'
     f'  <div class="{status_cls}"><span class="status-dot"></span>{status_txt}</div>'
@@ -908,8 +979,290 @@ sport_tab(tabs[1], "Run", "running", "orange", is_run=True)
 sport_tab(tabs[2], "Cycling", "bike", "blue", is_run=False)
 sport_tab(tabs[3], "Walk", "walking", "green", is_run=False)
 
-# --------------------------------------------------------------- 4. Sleep
+# --------------------------------------------------------------- 4. Weightlifting (Hevy)
 with tabs[4]:
+    accent = "#e3b341"
+    if hevy_error:
+        st.error(f"Could not load Hevy data: {hevy_error}")
+    if hevy_workouts.empty:
+        st.info(
+            "Enter your **Hevy API Key** in the sidebar (or set `[hevy] api_key = \"...\"` in `.streamlit/secrets.toml`) "
+            "or enable **Demo data** to explore your weightlifting telemetry."
+        )
+    else:
+        working_sets_df = hevy_sets[hevy_sets["set_type"] != "warmup"].copy() if not hevy_sets.empty else pd.DataFrame()
+        tot_tonnage = float(hevy_workouts["volume_kg"].sum())
+        tot_sets = int(hevy_workouts["working_sets"].sum())
+        tot_reps = int(hevy_workouts["total_reps"].sum())
+        avg_dur = float(hevy_workouts["duration_min"].mean()) if len(hevy_workouts) else 0.0
+        unique_ex = int(hevy_sets["exercise_title"].nunique()) if not hevy_sets.empty else 0
+        avg_rpe = float(working_sets_df["rpe"].dropna().mean()) if not working_sets_df.empty and working_sets_df["rpe"].notna().any() else None
+
+        c = st.columns(6)
+        kpi_card(
+            c[0],
+            "Lifting Sessions",
+            f"{len(hevy_workouts)}",
+            f"{len(hevy_workouts) / max(1, days / 7):.1f} / week",
+            "strength",
+            accent,
+        )
+        kpi_card(
+            c[1],
+            "Total Tonnage",
+            f"{tot_tonnage / 1000:,.1f} t" if tot_tonnage >= 10000 else f"{tot_tonnage:,.0f} kg",
+            f"Avg {tot_tonnage / max(1, len(hevy_workouts)):,.0f} kg / workout",
+            "calories",
+            accent,
+        )
+        kpi_card(
+            c[2],
+            "Working Sets",
+            f"{tot_sets:,}",
+            f"Avg {tot_sets / max(1, len(hevy_workouts)):.1f} sets / session",
+            "plan",
+            "#58a6ff",
+        )
+        kpi_card(
+            c[3],
+            "Total Reps",
+            f"{tot_reps:,}",
+            f"Avg {tot_reps / max(1, tot_sets):.1f} reps / set",
+            "cadence",
+            "#39d353",
+        )
+        kpi_card(
+            c[4],
+            "Session Duration",
+            f"{avg_dur:.0f} min",
+            f"{hevy_workouts['duration_min'].sum() / 60:,.1f} h total gym time",
+            "speed",
+            "#a371f7",
+        )
+        kpi_card(
+            c[5],
+            "Exercises & Effort",
+            f"{unique_ex} lifts",
+            f"Avg RPE {avg_rpe:.1f} / 10" if avg_rpe else "Tracked via Hevy API",
+            "insights",
+            "#f78166",
+        )
+
+        section_header("Weightlifting Consistency", "Daily volume lifted (kg) across the past 52 weeks", "strength", accent)
+        contribution_graph(hevy_workouts, "volume_kg", "Hevy — Daily Volume Lifted (kg)", unit="kg", palette="amber")
+
+        # Weekly Tonnage + Muscle Group Breakdown
+        l, r = st.columns([1.35, 1])
+        wk_lift = hevy_workouts.set_index("day").resample("W")["volume_kg"].sum().reset_index()
+        wk_lift["roll4"] = wk_lift["volume_kg"].rolling(4, min_periods=1).mean()
+        wfig = go.Figure()
+        wfig.add_trace(go.Bar(x=wk_lift["day"], y=wk_lift["volume_kg"], name="Weekly Volume (kg)", marker_color=accent, opacity=0.84))
+        wfig.add_trace(go.Scatter(x=wk_lift["day"], y=wk_lift["roll4"], name="4-wk avg", line=dict(color="#f0f6fc", width=2.3)))
+        wfig.update_layout(title="Weekly Tonnage Lifted (kg)")
+        l.plotly_chart(layout(wfig, 340), width="stretch")
+
+        if not working_sets_df.empty:
+            muscle_grp = (
+                working_sets_df.groupby("muscle_group", as_index=False)
+                .agg(working_sets=("set_index", "count"), volume_kg=("volume_kg", "sum"))
+                .sort_values("working_sets", ascending=True)
+            )
+            mfig = px.bar(
+                muscle_grp,
+                x="working_sets",
+                y="muscle_group",
+                orientation="h",
+                text="working_sets",
+                color="volume_kg",
+                color_continuous_scale=["#3d2a0d", "#a87419", "#e3b341", "#f78166"],
+                title="Working Sets by Muscle Group",
+            )
+            mfig.update_traces(textposition="outside")
+            mfig.update_xaxes(range=[0, max(muscle_grp["working_sets"].max() * 1.22, 5)])
+            mfig.update_layout(coloraxis_showscale=False)
+            r.plotly_chart(layout(mfig, 340), width="stretch")
+
+        # Exercise Progression & 1RM Tracker
+        if not working_sets_df.empty:
+            section_header(
+                "Exercise Progression & Estimated 1RM",
+                "Track top weight, Epley 1RM, and volume overload for any exercise",
+                "insights",
+                accent,
+            )
+            ex_counts = (
+                working_sets_df.groupby("exercise_title")
+                .agg(sessions=("workout_id", "nunique"), sets=("set_index", "count"), max_wt=("weight_kg", "max"))
+                .sort_values(["sessions", "sets"], ascending=False)
+            )
+            ex_options = list(ex_counts.index)
+            selected_ex = st.selectbox(
+                "Select Exercise",
+                ex_options,
+                index=0,
+                format_func=lambda x: f"{x} ({ex_counts.loc[x, 'sessions']} sessions · max {ex_counts.loc[x, 'max_wt']:.1f} kg)",
+            )
+            ex_df = working_sets_df[working_sets_df["exercise_title"] == selected_ex].copy()
+
+            if not ex_df.empty:
+                best_wt_row = ex_df.sort_values(["weight_kg", "reps"], ascending=False).iloc[0]
+                best_1rm_row = ex_df.sort_values("e1rm_kg", ascending=False).iloc[0]
+                best_vol_row = ex_df.sort_values("volume_kg", ascending=False).iloc[0]
+
+                ec = st.columns(4)
+                kpi_card(
+                    ec[0],
+                    "Heaviest Weight (PR)",
+                    f"{best_wt_row['weight_kg']:.1f} kg",
+                    f"{int(best_wt_row['reps'])} reps on {pd.to_datetime(best_wt_row['date']):%d %b %Y}",
+                    "strength",
+                    accent,
+                )
+                kpi_card(
+                    ec[1],
+                    "Best Est. 1RM (Epley)",
+                    f"{best_1rm_row['e1rm_kg']:.1f} kg",
+                    f"From {best_1rm_row['weight_kg']:.1f} kg × {int(best_1rm_row['reps'])}",
+                    "race_predictor",
+                    "#f78166",
+                )
+                kpi_card(
+                    ec[2],
+                    "Best Single-Set Volume",
+                    f"{best_vol_row['volume_kg']:,.0f} kg",
+                    f"{best_vol_row['weight_kg']:.1f} kg × {int(best_vol_row['reps'])} reps",
+                    "calories",
+                    "#39d353",
+                )
+                kpi_card(
+                    ec[3],
+                    "Logged Working Sets",
+                    f"{len(ex_df)}",
+                    f"Across {ex_df['workout_id'].nunique()} workouts ({ex_df['muscle_group'].iloc[0]})",
+                    "plan",
+                    "#58a6ff",
+                )
+
+                ex_session = (
+                    ex_df.groupby("day", as_index=False)
+                    .agg(
+                        top_weight_kg=("weight_kg", "max"),
+                        best_e1rm_kg=("e1rm_kg", "max"),
+                        session_volume_kg=("volume_kg", "sum"),
+                        total_reps=("reps", "sum"),
+                        sets=("set_index", "count"),
+                    )
+                    .sort_values("day")
+                )
+
+                p_left, p_right = st.columns(2)
+                efig = go.Figure()
+                efig.add_trace(
+                    go.Scatter(
+                        x=ex_session["day"],
+                        y=ex_session["best_e1rm_kg"],
+                        mode="lines+markers",
+                        name="Estimated 1RM (kg)",
+                        line=dict(color="#f78166", width=2.5),
+                        marker=dict(size=6, color="#f78166"),
+                    )
+                )
+                efig.add_trace(
+                    go.Scatter(
+                        x=ex_session["day"],
+                        y=ex_session["top_weight_kg"],
+                        mode="lines+markers",
+                        name="Top Set Weight (kg)",
+                        line=dict(color=accent, width=2.4),
+                        marker=dict(size=6, color=accent),
+                    )
+                )
+                efig.update_layout(title=f"{selected_ex} — Strength & e1RM Progression")
+                p_left.plotly_chart(layout(efig, 320), width="stretch")
+
+                vfig = go.Figure()
+                vfig.add_trace(
+                    go.Bar(
+                        x=ex_session["day"],
+                        y=ex_session["session_volume_kg"],
+                        name="Session Volume (kg)",
+                        marker_color="#58a6ff",
+                        opacity=0.85,
+                    )
+                )
+                vfig.update_layout(title=f"{selected_ex} — Volume per Session (kg)")
+                p_right.plotly_chart(layout(vfig, 320), width="stretch")
+
+            # Personal Records Leaderboard across exercises
+            section_header("Personal Records Leaderboard", "All-time best lifts in the selected window", "race_predictor", accent)
+            pr_rows = []
+            for lift_name, grp in working_sets_df.groupby("exercise_title"):
+                if grp["weight_kg"].max() <= 0:
+                    continue
+                top_w = grp.sort_values(["weight_kg", "reps"], ascending=False).iloc[0]
+                top_1rm = grp.sort_values("e1rm_kg", ascending=False).iloc[0]
+                pr_rows.append({
+                    "Exercise": lift_name,
+                    "Muscle Group": grp["muscle_group"].iloc[0],
+                    "Sessions": grp["workout_id"].nunique(),
+                    "Working Sets": len(grp),
+                    "Heaviest Weight (kg)": round(float(top_w["weight_kg"]), 1),
+                    "Top Set": f"{top_w['weight_kg']:.1f} kg × {int(top_w['reps'])}",
+                    "Est. 1RM (kg)": round(float(top_1rm["e1rm_kg"]), 1),
+                    "Total Volume (kg)": round(float(grp["volume_kg"].sum()), 0),
+                    "PR Date": pd.to_datetime(top_1rm["date"]).strftime("%d %b %Y"),
+                })
+            if pr_rows:
+                pr_df = pd.DataFrame(pr_rows).sort_values(["Sessions", "Est. 1RM (kg)"], ascending=False).reset_index(drop=True)
+                st.dataframe(pr_df, width="stretch", hide_index=True)
+
+        # Saved Hevy Routines (if present)
+        if not hevy_routines.empty:
+            section_header("Saved Hevy Routines", f"{len(hevy_routines)} active templates", "plan", "#58a6ff")
+            r_cols = st.columns(min(3, len(hevy_routines)))
+            for idx_r, (_, rt) in enumerate(hevy_routines.head(6).iterrows()):
+                with r_cols[idx_r % len(r_cols)]:
+                    st.markdown(
+                        f'<div class="kpi-card">'
+                        f'  <div class="kpi-top"><span class="kpi-label">{rt["exercises_count"]} EXERCISES · {rt["total_sets"]} SETS</span>'
+                        f'{icon_html("strength", size=16, bg="#e3b3411a", accent=accent, badge=True, mr=0)}</div>'
+                        f'  <div style="font-weight:700;font-size:1.02rem;color:#f0f6fc;margin-bottom:6px;">{rt["title"]}</div>'
+                        f'  <div style="font-size:0.78rem;color:#8b949e;line-height:1.4;">{rt["exercises_summary"]}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        # Recent Hevy Workouts & Set-by-Set Log
+        section_header("Recent Hevy Workouts", f"Showing latest {min(25, len(hevy_workouts))} sessions with set-by-set breakdown", "strength", accent)
+        for idx_w, w in hevy_workouts.head(25).iterrows():
+            w_date_str = pd.to_datetime(w["date"]).strftime("%a %d %b %Y · %H:%M")
+            rpe_txt = f" · Avg RPE {w['avg_rpe']:.1f}" if pd.notna(w.get("avg_rpe")) else ""
+            header_label = (
+                f"🏋️ {w['title']} — {w_date_str}  ·  "
+                f"{w['volume_kg']:,.0f} kg  ·  {w['working_sets']} sets ({w['total_reps']} reps)  ·  "
+                f"{w['duration_min']:.0f} min  ·  {w['primary_muscles']}{rpe_txt}"
+            )
+            with st.expander(header_label, expanded=(idx_w == 0)):
+                w_sets = hevy_sets[hevy_sets["workout_id"] == w["id"]].copy()
+                if not w_sets.empty:
+                    disp = w_sets[[
+                        "exercise_title", "muscle_group", "set_index", "set_type",
+                        "weight_kg", "reps", "volume_kg", "e1rm_kg", "rpe",
+                    ]].rename(columns={
+                        "exercise_title": "Exercise",
+                        "muscle_group": "Muscle",
+                        "set_index": "Set #",
+                        "set_type": "Type",
+                        "weight_kg": "Weight (kg)",
+                        "reps": "Reps",
+                        "volume_kg": "Volume (kg)",
+                        "e1rm_kg": "Est. 1RM (kg)",
+                        "rpe": "RPE",
+                    })
+                    st.dataframe(disp.round(1), width="stretch", hide_index=True)
+
+# --------------------------------------------------------------- 5. Sleep
+with tabs[5]:
     if sleep.empty:
         st.info("No sleep data available for this period.")
     else:
@@ -952,8 +1305,8 @@ with tabs[4]:
             sfig.update_layout(title="Garmin Sleep Score Trend")
             st.plotly_chart(layout(sfig, 300), width="stretch")
 
-# --------------------------------------------------------------- 5. Recovery & Fitness
-with tabs[5]:
+# --------------------------------------------------------------- 6. Recovery & Fitness
+with tabs[6]:
     c = st.columns(6)
     kpi_card(
         c[0],
@@ -1102,8 +1455,8 @@ with tabs[5]:
             bfig.update_layout(title="Body Battery Peak & Daily Stress", barmode="overlay")
             r2.plotly_chart(layout(bfig), width="stretch")
 
-# --------------------------------------------------------------- 6. Race Predictions
-with tabs[6]:
+# --------------------------------------------------------------- 7. Race Predictions
+with tabs[7]:
     if not preds:
         st.info("No race predictions available (needs VO₂max or recent runs ≥ 3 km).")
     else:
@@ -1150,8 +1503,8 @@ with tabs[6]:
             section_header("Recommended Training Zones", "Paces calibrated from your race profile", "speed", "#58a6ff")
             st.dataframe(zones, width="stretch", hide_index=True)
 
-# --------------------------------------------------------------- 7. Activity Log
-with tabs[7]:
+# --------------------------------------------------------------- 8. Activity Log
+with tabs[8]:
     f1, f2 = st.columns([2, 1])
     cats = f1.multiselect("Filter by sport", list(COLORS), default=list(COLORS))
     limit = f2.selectbox("Show recent", [30, 60, 100, 250], index=1)
