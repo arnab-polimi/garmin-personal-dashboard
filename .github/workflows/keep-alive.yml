@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      APP_URL: ${{ secrets.STREAMLIT_APP_URL || vars.STREAMLIT_APP_URL || 'https://garmin-personal-dashboard.streamlit.app' }}
+      APP_URL: ${{ secrets.STREAMLIT_APP_URL || vars.STREAMLIT_APP_URL || 'https://the-daily-show-up.streamlit.app/' }}
 
     steps:
       - name: Set up Python
