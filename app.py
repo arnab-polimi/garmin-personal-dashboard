@@ -12,7 +12,12 @@ import data
 
 # Ensure `data` module is hot-reloaded on Streamlit Cloud when data.py is updated in-place
 _data_mtime = Path(data.__file__).stat().st_mtime if getattr(data, "__file__", None) else None
-if getattr(data, "_LOADED_MTIME", None) != _data_mtime or not hasattr(data, "compute_correlations_and_insights"):
+if (
+    getattr(data, "_LOADED_MTIME", None) != _data_mtime
+    or not hasattr(data, "compute_correlations_and_insights")
+    or not hasattr(data, "compute_body_state_now")
+    or not hasattr(data, "compute_race_predictions")
+):
     data = importlib.reload(data)
     data._LOADED_MTIME = _data_mtime
 
@@ -623,16 +628,37 @@ except Exception as e:
 acts, sleep, hrv, daily, vo2, preds = (
     D[k] for k in ["activities", "sleep", "hrv", "daily", "vo2max", "predictions"]
 )
+all_acts = D.get("all_activities", acts)
 hevy_workouts = H.get("workouts", pd.DataFrame())
 hevy_sets = H.get("sets", pd.DataFrame())
 hevy_routines = H.get("routines", pd.DataFrame())
 hevy_measurements = H.get("measurements", pd.DataFrame())
 
-ts = D.get("training_status") or data._compute_training_status(acts, vo2, hrv, daily, days)
+body_state = D.get("body_state") or data.compute_body_state_now(acts, sleep, hrv, daily, hevy_workouts=hevy_workouts)
+latest_vo2_val = float(vo2["vo2max"].iloc[-1]) if not vo2.empty else None
+race_details = D.get("race_details")
+if not race_details:
+    preds, race_details = data.compute_race_predictions(
+        latest_vo2_val, acts, all_acts=all_acts, daily_df=daily, body_state=body_state
+    )
+
+ts = D.get("training_status") or data._compute_training_status(acts, vo2, hrv, daily, days, sleep_df=sleep)
 acts["day"] = pd.to_datetime(acts["date"]).dt.normalize()
 
 with st.sidebar:
     st.divider()
+    bs_col = body_state["state_color"]
+    st.markdown(
+        f'<div style="background:#12171f;border:1px solid {bs_col}44;border-radius:10px;padding:12px 14px;margin-bottom:10px;">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">'
+        f'  <span style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;">Body Readiness Now</span>'
+        f'  <span style="font-size:0.72rem;font-weight:700;color:{bs_col};background:{bs_col}1f;padding:2px 8px;border-radius:999px;">{body_state["readiness_score"]}/100 · {body_state["state_badge"]}</span>'
+        f'</div>'
+        f'<div style="font-size:0.76rem;color:#c9d1d9;margin-top:4px;">'
+        f'HRV <b>{body_state["hrv_now"] or 0:.0f} ms</b> · RHR <b>{body_state["rhr_now"] or 0:.0f} bpm</b> · BB <b>{body_state["bb_now"] or 0:.0f}</b></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown(
         f'<div style="background:#12171f;border:1px solid {ts["color"]}44;border-radius:10px;padding:12px 14px;margin-bottom:10px;">'
         f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">'
@@ -803,8 +829,9 @@ with tabs[0]:
         "#a371f7",
     )
 
-    # Garmin Training Status Banner
+    # Garmin Training Status & Live Somatic Readiness Banner
     ts_col = ts["color"]
+    bs_col = body_state["state_color"]
     vo2_sign = f"{ts['vo2_delta_4w']:+.1f}" if ts.get("vo2_delta_4w") else "0.0"
     st.markdown(
         f'<div class="ts-banner" style="border-left: 4px solid {ts_col};">'
@@ -816,11 +843,19 @@ with tabs[0]:
         f'        <span class="ts-badge" style="background:{ts_col}22;color:{ts_col};border:1px solid {ts_col}55;">'
         f'          <span class="status-dot"></span>{ts["status"]}'
         f'        </span>'
+        f'        <span class="ts-badge" style="background:{bs_col}22;color:{bs_col};border:1px solid {bs_col}55;">'
+        f'          Readiness {body_state["readiness_score"]}/100 · {body_state["state_badge"]}'
+        f'        </span>'
         f'      </div>'
         f'      <div class="ts-headline">{ts["headline"]}</div>'
         f'    </div>'
         f'  </div>'
         f'  <div class="ts-metrics">'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">Body Readiness</div>'
+        f'      <div class="ts-chip-val" style="color:{bs_col};">{body_state["readiness_score"]}/100</div>'
+        f'      <div class="ts-chip-sub">BB {body_state["bb_now"] or 0:.0f} · Sleep {body_state["sl_score_now"] or 0:.0f}</div>'
+        f'    </div>'
         f'    <div class="ts-chip">'
         f'      <div class="ts-chip-lbl">7d Acute Load</div>'
         f'      <div class="ts-chip-val">{ts["acute_load"]} <span style="font-size:0.75rem;color:{ts_col};">({ts["load_status"]})</span></div>'
@@ -832,14 +867,9 @@ with tabs[0]:
         f'      <div class="ts-chip-sub">28d Chronic: {ts["chronic_load"]}</div>'
         f'    </div>'
         f'    <div class="ts-chip">'
-        f'      <div class="ts-chip-lbl">VO₂max Trend</div>'
-        f'      <div class="ts-chip-val">{ts["vo2_trend"]}</div>'
-        f'      <div class="ts-chip-sub">4w delta: {vo2_sign} mL/kg</div>'
-        f'    </div>'
-        f'    <div class="ts-chip">'
         f'      <div class="ts-chip-lbl">HRV Status</div>'
         f'      <div class="ts-chip-val">{ts["hrv_status"]}</div>'
-        f'      <div class="ts-chip-sub">Autonomic recovery</div>'
+        f'      <div class="ts-chip-sub">RHR {body_state["rhr_now"] or 0:.0f} bpm (base {body_state["rhr_base"]:.0f})</div>'
         f'    </div>'
         f'  </div>'
         f'</div>',
@@ -1469,48 +1499,208 @@ with tabs[7]:
     if not preds:
         st.info("No race predictions available (needs VO₂max or recent runs ≥ 3 km).")
     else:
-        section_header("Projected Race Finish Times", "Based on your peak recent running VDOT & aerobic profile", "race_predictor", "#f78166")
+        rd = race_details or {}
+        eff_vdot = rd.get("effective_vdot") or 34.4
+        race_vdot = rd.get("race_vdot")
+        submax_vdot = rd.get("submax_vdot")
+        lab_vo2 = rd.get("lab_vo2max") or (float(vo2["vo2max"].iloc[-1]) if not vo2.empty else 44.5)
+        wk_km = rd.get("weekly_km") or 0.0
+        long_km = rd.get("longest_run_km") or 0.0
+        end_mult = rd.get("endurance_mult") or {"5K": 1.0, "10K": 1.0, "Half marathon": 1.0, "Marathon": 1.0}
+        pure_preds = rd.get("pure_vdot_preds") or preds
+        today_preds = rd.get("today_preds") or preds
+        today_pen = rd.get("today_penalty_pct") or 0.0
+        best_bench = rd.get("best_benchmark") or {}
+
+        section_header(
+            "Projected Race Finish Times (Peak / Tapered vs. Today's Readiness)",
+            f"Calibrated to Effective Running VDOT {eff_vdot:.1f} · 4-wk volume {wk_km:.1f} km/wk · Today's Readiness {body_state['readiness_score']}/100",
+            "race_predictor",
+            "#f78166",
+        )
         dist = {"5K": 5.0, "10K": 10.0, "Half marathon": 21.0975, "Marathon": 42.195}
         cols = st.columns(len(preds))
         for col, (k, secs) in zip(cols, preds.items()):
+            td_s = today_preds.get(k, secs)
+            td_txt = f" · Today: {fmt_time(td_s)}" if today_pen > 0 else " · Ready today"
             kpi_card(
                 col,
-                k,
+                f"{k} (Peak / Rested)",
                 fmt_time(secs),
-                f"Pace: {fmt_time(secs / dist[k])} /km · {dist[k] / (secs / 3600):.1f} km/h",
+                f"{fmt_time(secs / dist[k])}/km ({dist[k] / (secs / 3600):.1f} km/h){td_txt}",
                 "race_predictor",
                 "#f78166",
             )
 
+        # Transparent Methodology & Calibration Section
+        section_header(
+            "How Your Race Predictions Are Calculated",
+            "Exact physiological inputs, equations, and why raw watch VO₂max differs from race VDOT",
+            "insights",
+            "#58a6ff",
+        )
+        mc = st.columns(4)
+        kpi_card(
+            mc[0],
+            "Effective Running VDOT",
+            f"{eff_vdot:.2f}",
+            f"72% Race PB ({race_vdot or eff_vdot:.1f}) + 28% 6w HR-Submax ({submax_vdot or eff_vdot:.1f})",
+            "running",
+            "#f78166",
+        )
+        bench_lbl = f"{best_bench.get('name', 'Best Run')[:22]} ({pd.to_datetime(best_bench['date']):%d %b})" if best_bench.get("date") is not None else "Verified Best Run"
+        bench_val = f"VDOT {race_vdot:.1f}" if race_vdot else f"VDOT {eff_vdot:.1f}"
+        kpi_card(
+            mc[1],
+            "Verified Race Anchor",
+            bench_val,
+            f"{bench_lbl} · {fmt_time(best_bench.get('pace_s_per_km', 338))}/km" if best_bench else "From fastest recorded race/time trial",
+            "race_predictor",
+            "#39d353",
+        )
+        kpi_card(
+            mc[2],
+            "Endurance Scaling",
+            f"{wk_km:.1f} km/wk",
+            f"Longest run {long_km:.1f} km → HM +{(end_mult.get('Half marathon', 1)-1)*100:.1f}%, Mar +{(end_mult.get('Marathon', 1)-1)*100:.1f}%",
+            "plan",
+            "#58a6ff",
+        )
+        kpi_card(
+            mc[3],
+            "Today's Fatigue Adjustment",
+            f"+{today_pen:.1f}% slower" if today_pen > 0 else "0.0% (Fresh)",
+            f"Readiness {body_state['readiness_score']}/100 · HRV {body_state['hrv_now'] or 0:.0f} ms · RHR {body_state['rhr_now'] or 0:.0f} bpm",
+            "recovery",
+            body_state["state_color"],
+        )
+
+        st.markdown(
+            f'<div class="kpi-card" style="border-left: 4px solid #58a6ff; padding: 14px 18px; margin-bottom: 16px;">'
+            f'  <div style="font-weight:700;color:#f0f6fc;font-size:0.92rem;margin-bottom:6px;">'
+            f'    📐 Calculation Formula & Why Raw VO₂max ({lab_vo2:.1f} mL/kg/min) ≠ Running VDOT ({eff_vdot:.1f})'
+            f'  </div>'
+            f'  <div style="font-size:0.82rem;color:#c9d1d9;line-height:1.52;">'
+            f'    <b>1. Why the old estimate was ~5–10 min too fast:</b> Standard watch/ACSM VO₂max (<b>{lab_vo2:.1f} mL/kg/min</b>) estimates gross laboratory oxygen uptake '
+            f'(which includes <code>+3.5 mL/kg/min</code> resting metabolism and assumes elite running economy). Plugging raw {lab_vo2:.1f} directly into Jack Daniels\' race equations '
+            f'falsely predicted a ~22:25 5K and ~46:26 10K.<br>'
+            f'    <b>2. Exact Jack Daniels & Gilbert VDOT Solver:</b> We compute your true performance <b>VDOT ({eff_vdot:.2f})</b> directly from your verified race/split efforts '
+            f'(e.g., <b>10.19 km in 57:25 @ 5:38/km = 34.8 VDOT</b> & <b>5K split in 27:22 = 34.4 VDOT</b>) blended with your last 6 weeks of HR-calibrated quality runs '
+            f'(solving <code>VO₂(v) = -4.60 + 0.182258·v + 0.000104·v²</code> divided by <code>%HRR</code> between RHR {rd.get("rhr_used", 55):.0f} and Max HR {rd.get("mhr_used", 195):.0f} bpm, giving <b>{submax_vdot or eff_vdot:.1f} VDOT</b>).<br>'
+            f'    <b>3. Time-Dependent %VO₂max & Mileage Endurance Factor:</b> For each race distance, we iteratively solve '
+            f'<code>VO₂(d/t) / [0.8 + 0.1894·e^(-0.0128·t) + 0.2989·e^(-0.1933·t)] = VDOT</code>, then apply a Riegel endurance adjustment for Half Marathon (<b>+{(end_mult.get("Half marathon", 1)-1)*100:.1f}%</b>) '
+            f'and Marathon (<b>+{(end_mult.get("Marathon", 1)-1)*100:.1f}%</b>) based on your current 4-week volume (<b>{wk_km:.1f} km/wk</b>) and longest run (<b>{long_km:.1f} km</b>).'
+            f'  </div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Detailed Race Table: Peak vs Pure VDOT vs Today's Fatigued State
+        comp_rows = []
+        for k, d_km in dist.items():
+            if k not in preds:
+                continue
+            pk_s = preds[k]
+            pr_s = pure_preds.get(k, pk_s)
+            td_s = today_preds.get(k, pk_s)
+            mult_pct = (end_mult.get(k, 1.0) - 1.0) * 100.0
+            comp_rows.append({
+                "Race Distance": k,
+                "Peak / Tapered Time": fmt_time(pk_s),
+                "Target Pace (/km)": fmt_time(pk_s / d_km) + " /km",
+                "Avg Speed": f"{d_km / (pk_s / 3600.0):.2f} km/h",
+                "Pure VDOT Ceiling": fmt_time(pr_s),
+                "Endurance Volume Adj.": f"+{mult_pct:.1f}%" if mult_pct > 0 else "0.0% (Optimal)",
+                f"Today's Time (Readiness {body_state['readiness_score']}/100)": fmt_time(td_s) + (f" (+{fmt_time(td_s - pk_s)})" if td_s > pk_s else ""),
+            })
+        st.dataframe(pd.DataFrame(comp_rows), width="stretch", hide_index=True)
+
         l, r = st.columns([1.2, 1])
-        pdf = pd.DataFrame({
-            "Race": list(preds),
-            "Pace (min/km)": [preds[k] / dist[k] / 60 for k in preds],
-            "Pace Label": [fmt_time(preds[k] / dist[k]) + "/km" for k in preds],
-        })
+        pdf = pd.DataFrame([
+            {"Race": k, "Condition": "Peak / Tapered", "Pace (min/km)": preds[k] / dist[k] / 60.0, "Pace Label": fmt_time(preds[k] / dist[k]) + "/km"}
+            for k in preds
+        ] + ([
+            {"Race": k, "Condition": f"Today (Readiness {body_state['readiness_score']}/100)", "Pace (min/km)": today_preds[k] / dist[k] / 60.0, "Pace Label": fmt_time(today_preds[k] / dist[k]) + "/km"}
+            for k in preds
+        ] if today_pen > 0 else []))
         pfig = px.bar(
             pdf,
             x="Race",
             y="Pace (min/km)",
+            color="Condition",
+            barmode="group",
             text="Pace Label",
-            title="Target Race Pace Progression",
+            color_discrete_map={
+                "Peak / Tapered": "#f78166",
+                f"Today (Readiness {body_state['readiness_score']}/100)": "#e3b341",
+            },
+            title="Target Race Pace: Peak / Rested vs. Today's Readiness",
         )
-        pfig.update_traces(marker_color="#f78166", textposition="outside")
-        pfig.update_yaxes(range=[0, max(pdf["Pace (min/km)"]) * 1.18])
-        l.plotly_chart(layout(pfig, 340), width="stretch")
+        pfig.update_traces(textposition="outside")
+        pfig.update_yaxes(range=[0, max(pdf["Pace (min/km)"]) * 1.22])
+        l.plotly_chart(layout(pfig, 350), width="stretch")
 
-        # Training pace zones derived from 5K/10K pace
-        p5k = preds.get("5K", 1500) / 5.0  # sec/km
+        # Training pace zones derived from calibrated 5K/10K VDOT pace
+        p5k = preds.get("5K", 1643) / 5.0  # sec/km
         zones = pd.DataFrame([
-            {"Zone": "Easy / Recovery", "Purpose": "Aerobic base & capillary density", "Pace (/km)": f"{fmt_time(p5k * 1.24)} – {fmt_time(p5k * 1.34)}"},
+            {"Zone": "Easy / Recovery", "Purpose": "Aerobic base & capillary density", "Pace (/km)": f"{fmt_time(p5k * 1.24)} – {fmt_time(p5k * 1.35)}"},
             {"Zone": "Marathon Pace", "Purpose": "Sustained aerobic endurance", "Pace (/km)": f"{fmt_time(p5k * 1.12)} – {fmt_time(p5k * 1.16)}"},
-            {"Zone": "Lactate Threshold", "Purpose": "Raise anaerobic threshold (~60m race pace)", "Pace (/km)": f"{fmt_time(p5k * 1.05)} – {fmt_time(p5k * 1.08)}"},
-            {"Zone": "VO₂max Interval", "Purpose": "Maximal aerobic power (3K–5K pace)", "Pace (/km)": f"{fmt_time(p5k * 0.98)} – {fmt_time(p5k * 1.01)}"},
-            {"Zone": "Repetition / Speed", "Purpose": "Running economy & neuromuscular speed", "Pace (/km)": f"{fmt_time(p5k * 0.91)} – {fmt_time(p5k * 0.95)}"},
+            {"Zone": "Lactate Threshold (Tempo)", "Purpose": "Raise anaerobic threshold (~60m race effort)", "Pace (/km)": f"{fmt_time(p5k * 1.05)} – {fmt_time(p5k * 1.08)}"},
+            {"Zone": "VO₂max Interval", "Purpose": "Maximal aerobic power (3K–5K pace)", "Pace (/km)": f"{fmt_time(p5k * 0.96)} – {fmt_time(p5k * 1.00)}"},
+            {"Zone": "Repetition / Speed", "Purpose": "Running economy & neuromuscular turnover", "Pace (/km)": f"{fmt_time(p5k * 0.90)} – {fmt_time(p5k * 0.94)}"},
         ])
         with r:
-            section_header("Recommended Training Zones", "Paces calibrated from your race profile", "speed", "#58a6ff")
+            section_header("Calibrated Training Zones", "Matched to your verified VDOT & 5K block", "speed", "#58a6ff")
             st.dataframe(zones, width="stretch", hide_index=True)
+
+        # Verified Race & Time-Trial Benchmarks + VDOT History
+        top_eff = rd.get("top_efforts") or []
+        vdot_tl = rd.get("vdot_timeline")
+        if top_eff or (isinstance(vdot_tl, pd.DataFrame) and not vdot_tl.empty):
+            b_left, b_right = st.columns([1.15, 1])
+            if top_eff:
+                with b_left:
+                    section_header("Verified Best Efforts & Splits Used as Anchors", "Top recorded VDOT performances", "race_predictor", "#39d353")
+                    eff_tbl = pd.DataFrame([
+                        {
+                            "Date": pd.to_datetime(e["date"]).strftime("%d %b %Y"),
+                            "Activity": e["name"],
+                            "Benchmark": e["type"],
+                            "Time": fmt_time(e["time_s"]),
+                            "Pace": fmt_time(e["pace_s_per_km"]) + " /km",
+                            "HR (Avg/Max)": f"{e['avg_hr']:.0f}/{e['max_hr']:.0f} bpm" if e.get("avg_hr") and e.get("max_hr") else "–",
+                            "VDOT": f"{e['vdot']:.1f}",
+                        }
+                        for e in top_eff
+                    ])
+                    st.dataframe(eff_tbl, width="stretch", hide_index=True)
+            if isinstance(vdot_tl, pd.DataFrame) and not vdot_tl.empty:
+                with b_right:
+                    vtl = vdot_tl.sort_values("date").copy()
+                    vtl["roll_vdot"] = vtl["vdot_hr"].rolling(4, min_periods=1).mean()
+                    vt_fig = go.Figure()
+                    vt_fig.add_trace(
+                        go.Scatter(
+                            x=vtl["date"],
+                            y=vtl["vdot_hr"],
+                            mode="markers",
+                            name="Workout HR-Calibrated VDOT",
+                            text=vtl["name"],
+                            marker=dict(size=7, color="#58a6ff", opacity=0.75),
+                        )
+                    )
+                    vt_fig.add_trace(
+                        go.Scatter(
+                            x=vtl["date"],
+                            y=vtl["roll_vdot"],
+                            mode="lines",
+                            name="4-Run Rolling VDOT",
+                            line=dict(color="#39d353", width=2.5),
+                        )
+                    )
+                    vt_fig.add_hline(y=eff_vdot, line_dash="dash", line_color="#f78166", annotation_text=f"Effective VDOT {eff_vdot:.1f}")
+                    vt_fig.update_layout(title="Submaximal HR-Calibrated VDOT Across Workouts")
+                    st.plotly_chart(layout(vt_fig, 300), width="stretch")
 
 # --------------------------------------------------------------- 8. Insights & Cross-Activity Correlations
 with tabs[8]:
@@ -1519,6 +1709,198 @@ with tabs[8]:
     insights_list = ci["insights"]
     corr_mat = ci["corr_matrix"]
     corr_labels = ci["corr_labels"]
+    bs = ci.get("body_state") or body_state
+
+    # =======================================================
+    # A. LIVE SOMATIC & AUTONOMIC STATE ("HOW YOUR BODY FEELS RIGHT NOW")
+    # =======================================================
+    bs_col = bs["state_color"]
+    section_header(
+        "How Your Body Is Feeling Right Now — Live Somatic & Autonomic Diagnostic",
+        "Real-time physiological state vs. your personal 28-day baselines across 6 internal systems",
+        "heartbeat",
+        bs_col,
+    )
+
+    st.markdown(
+        f'<div class="ts-banner" style="border-left: 5px solid {bs_col}; padding: 18px 22px; margin-bottom: 16px;">'
+        f'  <div class="ts-left">'
+        f'    {icon_html("heartbeat", size=28, bg=f"{bs_col}22", accent=bs_col, badge=True, mr=4)}'
+        f'    <div>'
+        f'      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+        f'        <span style="font-size:0.78rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;">Current Somatic State</span>'
+        f'        <span class="ts-badge" style="background:{bs_col}22;color:{bs_col};border:1px solid {bs_col}55;font-size:0.82rem;">'
+        f'          <span class="status-dot"></span>{bs["state_label"]} (Readiness {bs["readiness_score"]}/100)'
+        f'        </span>'
+        f'      </div>'
+        f'      <div style="font-size:0.92rem;color:#f0f6fc;font-weight:600;margin-top:6px;">{bs["headline"]}</div>'
+        f'    </div>'
+        f'  </div>'
+        f'  <div class="ts-metrics">'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">Somatic Readiness</div>'
+        f'      <div class="ts-chip-val" style="color:{bs_col};font-size:1.25rem;">{bs["readiness_score"]} / 100</div>'
+        f'      <div class="ts-chip-sub">{bs["state_badge"]}</div>'
+        f'    </div>'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">Last Night HRV</div>'
+        f'      <div class="ts-chip-val">{bs["hrv_now"] or 0:.0f} ms</div>'
+        f'      <div class="ts-chip-sub">Floor: {bs["hrv_low_band"]:.0f} ms ({bs["hrv_below_days"]}d low)</div>'
+        f'    </div>'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">Resting / Sleep HR</div>'
+        f'      <div class="ts-chip-val">{bs["rhr_now"] or 0:.0f} / {bs["sl_hr_now"] or 0:.0f} bpm</div>'
+        f'      <div class="ts-chip-sub">Base RHR: {bs["rhr_base"]:.1f} bpm</div>'
+        f'    </div>'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">Body Battery Peak</div>'
+        f'      <div class="ts-chip-val">{bs["bb_now"] or 0:.0f} / 100</div>'
+        f'      <div class="ts-chip-sub">28d Base: {bs["bb_base"]:.0f} / 100</div>'
+        f'    </div>'
+        f'    <div class="ts-chip">'
+        f'      <div class="ts-chip-lbl">Last Night Sleep</div>'
+        f'      <div class="ts-chip-val">Score {bs["sl_score_now"] or 0:.0f}</div>'
+        f'      <div class="ts-chip-sub">{bs["sl_h_now"] or 0:.1f}h · Stress {bs["sl_stress_now"] or 0:.0f}</div>'
+        f'    </div>'
+        f'  </div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 1. Expected Somatic Sensations ("What You Are Feeling / Supposed to Feel Right Now")
+    if bs.get("symptoms"):
+        st.markdown(
+            '<div style="font-size:0.9rem;font-weight:700;color:#f0f6fc;margin:4px 0 10px 0;">'
+            '🧠 What Your Body Is Experiencing Right Now (Expected Physical & Mental Sensations)</div>',
+            unsafe_allow_html=True,
+        )
+        sym_cols = st.columns(2)
+        for idx_s, sym in enumerate(bs["symptoms"]):
+            scol = sym_cols[idx_s % 2]
+            s_acc = sym["color"]
+            scol.markdown(
+                f'<div class="kpi-card" style="border-left: 4px solid {s_acc}; padding: 15px 18px;">'
+                f'  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;gap:8px;">'
+                f'    <div style="display:flex;align-items:center;gap:8px;">'
+                f'      {icon_html(sym["icon"], size=17, bg=f"{s_acc}1f", accent=s_acc, badge=True, mr=2)}'
+                f'      <div style="font-size:0.95rem;font-weight:700;color:#f0f6fc;">{sym["title"]}</div>'
+                f'    </div>'
+                f'    <span style="font-size:0.68rem;font-weight:700;text-transform:uppercase;color:{s_acc};background:{s_acc}1f;padding:3px 8px;border-radius:999px;">{sym["badge"]}</span>'
+                f'  </div>'
+                f'  <div style="font-size:0.82rem;color:#c9d1d9;line-height:1.48;">{sym["explanation"]}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # 2. 6-System Biomarker Scorecard vs Personal 28-Day Baselines
+    if bs.get("biomarkers"):
+        st.markdown(
+            '<div style="font-size:0.9rem;font-weight:700;color:#f0f6fc;margin:8px 0 10px 0;">'
+            '🔬 6-System Biomarker Scorecard (Today vs. Your Personal 28-Day Baseline)</div>',
+            unsafe_allow_html=True,
+        )
+        bm_cols = st.columns(3)
+        for idx_b, bm in enumerate(bs["biomarkers"]):
+            bcol = bm_cols[idx_b % 3]
+            b_acc = bm["color"]
+            bcol.markdown(
+                f'<div class="kpi-card" style="border-top: 3px solid {b_acc}; padding: 14px 16px;">'
+                f'  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">'
+                f'    <span style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:#8b949e;">{bm["system"]}</span>'
+                f'    <span style="font-size:0.66rem;font-weight:700;color:{b_acc};background:{b_acc}1f;padding:2px 7px;border-radius:999px;">{bm["status"]}</span>'
+                f'  </div>'
+                f'  <div style="font-family:\'JetBrains Mono\',monospace;font-size:1.28rem;font-weight:700;color:#f0f6fc;">{bm["value"]}</div>'
+                f'  <div style="font-size:0.75rem;color:{b_acc};font-weight:600;margin-top:3px;">{bm["delta"]} <span style="color:#8b949e;font-weight:400;">(Base: {bm["baseline"]})</span></div>'
+                f'  <div style="font-size:0.76rem;color:#c9d1d9;margin-top:7px;line-height:1.42;">{bm["note"]}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # 3. 14-Day Somatic Crash Timeline + Last 96-Hour Root-Cause Chain & Recovery Protocol
+    hist_14 = bs.get("history_14d")
+    t_left, t_right = st.columns([1.3, 1])
+    if isinstance(hist_14, pd.DataFrame) and not hist_14.empty:
+        with t_left:
+            rfig = go.Figure()
+            rfig.add_trace(
+                go.Scatter(
+                    x=hist_14["day"],
+                    y=hist_14["readiness"],
+                    mode="lines+markers",
+                    name="Somatic Readiness (0–100)",
+                    line=dict(color=bs_col, width=3.0),
+                    marker=dict(size=7, color=bs_col),
+                )
+            )
+            if hist_14["body_battery_high"].notna().any():
+                rfig.add_trace(
+                    go.Scatter(
+                        x=hist_14["day"],
+                        y=hist_14["body_battery_high"],
+                        mode="lines+markers",
+                        name="Body Battery Peak",
+                        line=dict(color="#e3b341", width=1.8, dash="dot"),
+                        marker=dict(size=5, color="#e3b341"),
+                    )
+                )
+            if hist_14["sleep_score"].notna().any():
+                rfig.add_trace(
+                    go.Scatter(
+                        x=hist_14["day"],
+                        y=hist_14["sleep_score"],
+                        mode="lines",
+                        name="Sleep Score",
+                        line=dict(color="#a371f7", width=1.8, dash="dash"),
+                    )
+                )
+            if hist_14["hrv"].notna().any():
+                rfig.add_trace(
+                    go.Scatter(
+                        x=hist_14["day"],
+                        y=hist_14["hrv"],
+                        mode="lines+markers",
+                        name="Nightly HRV (ms)",
+                        line=dict(color="#58a6ff", width=2.0),
+                        marker=dict(size=5, color="#58a6ff"),
+                    )
+                )
+            rfig.add_hline(y=bs["hrv_low_band"], line_dash="dot", line_color="rgba(88,166,255,0.45)", annotation_text=f"HRV Floor ({bs['hrv_low_band']:.0f} ms)")
+            rfig.update_layout(title="14-Day Somatic Readiness, Body Battery, Sleep Score & HRV Trajectory")
+            st.plotly_chart(layout(rfig, 370), width="stretch")
+
+    with t_right:
+        st.markdown(
+            '<div style="font-size:0.88rem;font-weight:700;color:#f0f6fc;margin:2px 0 8px 0;">'
+            '⏱️ Last 96-Hour Root-Cause Timeline (Why You Feel This Way)</div>',
+            unsafe_allow_html=True,
+        )
+        for tr in bs.get("triggers", []):
+            r_sc = tr["readiness"]
+            t_col = "#f85149" if r_sc < 35 else ("#e3b341" if r_sc < 55 else "#39d353")
+            flag_html = f'<div style="font-size:0.72rem;color:#f85149;margin-top:3px;">⚠️ Garmin Sensor Flag: {tr["device_flag"]}</div>' if tr.get("device_flag") else ""
+            st.markdown(
+                f'<div style="background:#12171f;border:1px solid #262c36;border-left:3px solid {t_col};border-radius:8px;padding:9px 12px;margin-bottom:7px;">'
+                f'  <div style="display:flex;justify-content:space-between;align-items:center;">'
+                f'    <span style="font-weight:700;font-size:0.82rem;color:#f0f6fc;">{tr["date_label"]} · {tr["workouts"]}</span>'
+                f'    <span style="font-size:0.72rem;color:#8b949e;">{tr["steps"]:,} steps · Load {tr["load"]}</span>'
+                f'  </div>'
+                f'  <div style="font-size:0.76rem;color:#c9d1d9;margin-top:3px;">{tr["metrics"]}</div>'
+                f'  {flag_html}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    if bs.get("recommendations"):
+        recs_html = "".join(f'<li style="margin-bottom:5px;">{r_item}</li>' for r_item in bs["recommendations"])
+        st.markdown(
+            f'<div class="kpi-card" style="border-left: 4px solid #39d353; padding: 14px 18px; margin-bottom: 18px;">'
+            f'  <div style="font-weight:700;color:#f0f6fc;font-size:0.9rem;margin-bottom:6px;">🩺 Actionable Recovery Prescription for Today</div>'
+            f'  <ul style="margin:0;padding-left:18px;font-size:0.82rem;color:#c9d1d9;line-height:1.48;">{recs_html}</ul>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
 
     section_header(
         "Auto-Discovered Physiological & Cross-Sport Patterns",
