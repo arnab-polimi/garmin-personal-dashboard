@@ -1263,7 +1263,9 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
             sr = _safe(client.get, f"/usersummary-service/stats/stress/daily/{cs}/{ce}", default=[])
         return sl, hrv, ds, st, sr
 
-    with ThreadPoolExecutor(min(6, max(1, len(chunks)))) as ex:
+    # Pre-authenticate once before parallel chunk requests
+    _safe(client.authenticate)
+    with ThreadPoolExecutor(min(4, max(1, len(chunks)))) as ex:
         chunk_results = list(ex.map(fetch_chunk, chunks))
 
     sleep_rows, nap_raw_list, hrv_rows, daily_by_date, bb_naps_by_date = [], [], [], {}, {}

@@ -827,11 +827,19 @@ with tabs[0]:
         "heartbeat",
         "#f85149",
     )
+    if len(sleep):
+        sl_latest_ov = sleep.sort_values("date").iloc[-1]
+        ov_sl_val = f"{sl_latest_ov.total_h:.1f} h"
+        ov_sc_lat = f"Score {sl_latest_ov.score:.0f}" if pd.notna(sl_latest_ov.get("score")) else "Latest"
+        ov_sc_avg = f"/{sleep.score.mean():.0f} avg" if sleep.score.notna().any() else ""
+        ov_sl_sub = f"Avg {sleep.total_h.mean():.1f} h · {ov_sc_lat}{ov_sc_avg}"
+    else:
+        ov_sl_val, ov_sl_sub = "–", "No sleep data"
     kpi_card(
         c[5],
-        "Avg Sleep",
-        f"{sleep.total_h.mean():.1f} h" if len(sleep) else "–",
-        f"Score {sleep.score.mean():.0f}/100" if len(sleep) and sleep.score.notna().any() else "Nightly average",
+        "Sleep (Latest / Avg)",
+        ov_sl_val,
+        ov_sl_sub,
         "sleep",
         "#a371f7",
     )
@@ -1311,26 +1319,149 @@ with tabs[5]:
     if sleep.empty:
         st.info("No sleep data available for this period.")
     else:
+        sl_sorted = sleep.sort_values("date").reset_index(drop=True)
+        latest_sl = sl_sorted.iloc[-1]
+        lat_date_str = pd.to_datetime(latest_sl["date"]).strftime("%d %b %Y")
+        lat_tot_h = float(latest_sl.get("total_h") or 0.0)
+        lat_h_int, lat_m_int = divmod(int(round(lat_tot_h * 60)), 60)
+        avg_tot_h = float(sleep["total_h"].mean())
+        avg_h_int, avg_m_int = divmod(int(round(avg_tot_h * 60)), 60)
+        diff_h = lat_tot_h - avg_tot_h
+
+        lat_score = float(latest_sl["score"]) if pd.notna(latest_sl.get("score")) else None
+        avg_score = float(sleep["score"].mean()) if sleep["score"].notna().any() else None
+        best_score = float(sleep["score"].max()) if sleep["score"].notna().any() else None
+        min_score = float(sleep["score"].min()) if sleep["score"].notna().any() else None
+
+        lat_deep_m = float(latest_sl.get("deep_h") or 0.0) * 60.0
+        lat_deep_pct = (float(latest_sl.get("deep_h") or 0.0) / max(0.1, lat_tot_h)) * 100.0
+        avg_deep_m = float(sleep["deep_h"].mean()) * 60.0
+        avg_deep_pct = (float(sleep["deep_h"].mean()) / max(0.1, avg_tot_h)) * 100.0
+
+        lat_rem_m = float(latest_sl.get("rem_h") or 0.0) * 60.0
+        lat_rem_pct = (float(latest_sl.get("rem_h") or 0.0) / max(0.1, lat_tot_h)) * 100.0
+        avg_rem_m = float(sleep["rem_h"].mean()) * 60.0
+        avg_rem_pct = (float(sleep["rem_h"].mean()) / max(0.1, avg_tot_h)) * 100.0
+
+        lat_light_h = float(latest_sl.get("light_h") or 0.0)
+        lat_awake_m = float(latest_sl.get("awake_h") or 0.0) * 60.0
+        avg_light_h = float(sleep["light_h"].mean())
+        avg_awake_m = float(sleep["awake_h"].mean()) * 60.0
+
+        lat_stress = float(latest_sl["sleep_stress"]) if "sleep_stress" in latest_sl and pd.notna(latest_sl.get("sleep_stress")) else None
+        avg_stress = float(sleep["sleep_stress"].dropna().mean()) if "sleep_stress" in sleep.columns and sleep["sleep_stress"].notna().any() else None
+        lat_sl_hr = float(latest_sl["sleep_hr"]) if "sleep_hr" in latest_sl and pd.notna(latest_sl.get("sleep_hr")) else None
+        avg_sl_hr = float(sleep["sleep_hr"].dropna().mean()) if "sleep_hr" in sleep.columns and sleep["sleep_hr"].notna().any() else None
+
+        tot_naps_cnt = int(len(naps)) if isinstance(naps, pd.DataFrame) and not naps.empty else int(sleep["nap_count"].sum() if "nap_count" in sleep.columns else 0)
+        tot_nap_m = float(naps["duration_min"].sum()) if isinstance(naps, pd.DataFrame) and not naps.empty else float(sleep["nap_min"].sum() if "nap_min" in sleep.columns else 0.0)
+        lat_nap_m = float(latest_sl.get("nap_min") or 0.0) if "nap_min" in latest_sl and pd.notna(latest_sl.get("nap_min")) else 0.0
+
+        section_header(
+            f"Latest Night vs. {days}-Day Sleep Baseline ({lat_date_str})",
+            "Every card displays both your latest recorded night and your period average side by side",
+            "sleep",
+            "#a371f7",
+        )
+
+        # Row 1: Latest Night Headline Metrics (with Average comparison in subtitle)
+        c_lat = st.columns(6)
+        kpi_card(
+            c_lat[0],
+            f"Last Night ({lat_date_str[:6]})",
+            f"{lat_tot_h:.2f} h ({lat_h_int}h {lat_m_int:02d}m)",
+            f"Avg: {avg_tot_h:.2f} h ({diff_h:+.2f} h)" + (f" · +{lat_nap_m:.0f}m nap" if lat_nap_m > 0 else ""),
+            "sleep",
+            "#39d353" if lat_tot_h >= 7.2 else ("#e3b341" if lat_tot_h >= 6.2 else "#f85149"),
+        )
+        kpi_card(
+            c_lat[1],
+            "Sleep Score (Latest / Avg)",
+            f"{lat_score:.0f} / 100" if lat_score is not None else "–",
+            f"Avg: {avg_score:.0f}/100 · Best: {best_score:.0f} · Low: {min_score:.0f}" if avg_score is not None else "Score not reported",
+            "optimalhealth",
+            "#39d353" if (lat_score or 0) >= 75 else ("#e3b341" if (lat_score or 0) >= 60 else "#f85149"),
+        )
+        kpi_card(
+            c_lat[2],
+            "Deep Sleep (Latest / Avg)",
+            f"{lat_deep_m:.0f} min ({lat_deep_pct:.0f}%)",
+            f"Avg: {avg_deep_m:.0f} min ({avg_deep_pct:.0f}% of total)",
+            "recovery",
+            "#1f6feb",
+        )
+        kpi_card(
+            c_lat[3],
+            "REM Sleep (Latest / Avg)",
+            f"{lat_rem_m:.0f} min ({lat_rem_pct:.0f}%)",
+            f"Avg: {avg_rem_m:.0f} min ({avg_rem_pct:.0f}% of total)",
+            "insights",
+            "#a371f7",
+        )
+        kpi_card(
+            c_lat[4],
+            "Light & Awake (Latest / Avg)",
+            f"{lat_light_h:.1f} h · {lat_awake_m:.0f}m awake",
+            f"Avg: {avg_light_h:.1f} h · {avg_awake_m:.0f}m awake",
+            "curious",
+            "#58a6ff",
+        )
+        kpi_card(
+            c_lat[5],
+            "Sleep Stress & HR (Latest / Avg)",
+            f"Stress {lat_stress:.0f} · {lat_sl_hr:.0f} bpm" if (lat_stress is not None and lat_sl_hr is not None) else (f"Stress {lat_stress:.0f}" if lat_stress is not None else "–"),
+            f"Avg: Stress {avg_stress:.0f} · {avg_sl_hr:.0f} bpm" if (avg_stress is not None and avg_sl_hr is not None) else "Overnight autonomic load",
+            "heartbeat",
+            "#f85149" if (lat_stress or 0) >= 25 else "#39d353",
+        )
+
+        # Row 2: Period Averages & Totals (with Latest comparison in subtitle)
         c = st.columns(6)
-        kpi_card(c[0], "Avg Sleep", f"{sleep.total_h.mean():.2f} h", f"{len(sleep)} nights tracked", "sleep", "#a371f7")
+        kpi_card(
+            c[0],
+            f"Avg Sleep ({len(sleep)}d)",
+            f"{avg_tot_h:.2f} h ({avg_h_int}h {avg_m_int:02d}m)",
+            f"Latest: {lat_tot_h:.2f} h · Max: {sleep.total_h.max():.1f} h · Min: {sleep.total_h.min():.1f} h",
+            "sleep",
+            "#a371f7",
+        )
         kpi_card(
             c[1],
-            "Sleep Score",
-            f"{sleep.score.mean():.0f} / 100" if sleep.score.notna().any() else "–",
-            f"Best: {sleep.score.max():.0f}" if sleep.score.notna().any() else "Score not reported",
+            "Avg Sleep Score",
+            f"{avg_score:.0f} / 100" if avg_score is not None else "–",
+            f"Latest: {lat_score:.0f}/100 · Best: {best_score:.0f}/100" if (avg_score is not None and lat_score is not None) else "Score not reported",
             "optimalhealth",
             "#39d353",
         )
-        kpi_card(c[2], "Deep Sleep", f"{sleep.deep_h.mean() * 60:.0f} min", f"{sleep.deep_h.mean() / sleep.total_h.mean() * 100:.0f}% of total", "recovery", "#1f6feb")
-        kpi_card(c[3], "REM Sleep", f"{sleep.rem_h.mean() * 60:.0f} min", f"{sleep.rem_h.mean() / sleep.total_h.mean() * 100:.0f}% of total", "insights", "#a371f7")
-        kpi_card(c[4], "Light / Awake", f"{sleep.light_h.mean():.1f} h", f"Awake avg {sleep.awake_h.mean() * 60:.0f} min", "curious", "#58a6ff")
-        tot_naps_cnt = int(len(naps)) if isinstance(naps, pd.DataFrame) and not naps.empty else int(sleep["nap_count"].sum() if "nap_count" in sleep.columns else 0)
-        tot_nap_m = float(naps["duration_min"].sum()) if isinstance(naps, pd.DataFrame) and not naps.empty else float(sleep["nap_min"].sum() if "nap_min" in sleep.columns else 0.0)
+        kpi_card(
+            c[2],
+            "Avg Deep Sleep",
+            f"{avg_deep_m:.0f} min ({avg_deep_pct:.0f}%)",
+            f"Latest: {lat_deep_m:.0f} min ({lat_deep_pct:.0f}%)",
+            "recovery",
+            "#1f6feb",
+        )
+        kpi_card(
+            c[3],
+            "Avg REM Sleep",
+            f"{avg_rem_m:.0f} min ({avg_rem_pct:.0f}%)",
+            f"Latest: {lat_rem_m:.0f} min ({lat_rem_pct:.0f}%)",
+            "insights",
+            "#a371f7",
+        )
+        kpi_card(
+            c[4],
+            "Avg Light / Awake",
+            f"{avg_light_h:.1f} h · {avg_awake_m:.0f}m awake",
+            f"Latest: {lat_light_h:.1f} h · {lat_awake_m:.0f}m awake",
+            "curious",
+            "#58a6ff",
+        )
         kpi_card(
             c[5],
             "Daytime Naps",
-            f"{tot_naps_cnt} naps" if tot_naps_cnt > 0 else "0 naps",
-            f"{tot_nap_m:.0f} min total · Avg {tot_nap_m / tot_naps_cnt:.0f} min" if tot_naps_cnt > 0 else "No naps in selected window",
+            f"{tot_naps_cnt} naps ({tot_nap_m:.0f}m)" if tot_naps_cnt > 0 else "0 naps",
+            f"Latest: {naps.iloc[0]['duration_min']:.0f}m ({pd.to_datetime(naps.iloc[0]['date']):%d %b}) · Avg {tot_nap_m / tot_naps_cnt:.0f}m" if (isinstance(naps, pd.DataFrame) and not naps.empty) else "No naps in selected window",
             "sleep",
             "#e3b341" if tot_naps_cnt > 0 else "#8b949e",
         )
