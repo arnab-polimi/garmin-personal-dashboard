@@ -759,10 +759,10 @@ st.markdown(
 def _render_decision_dialog_body(res: dict):
     v_col = res["color"]
     badge_map = {
-        "green": ("#39d353", "rgba(57, 211, 83, 0.14)", "✓ OPTIMAL"),
-        "amber": ("#e3b341", "rgba(227, 179, 65, 0.15)", "⚠ CAUTION"),
-        "red": ("#f85149", "rgba(248, 81, 73, 0.15)", "✕ STRAIN"),
-        "blue": ("#58a6ff", "rgba(88, 166, 255, 0.14)", "ℹ CONTEXT"),
+        "green": ("#39d353", "rgba(57, 211, 83, 0.14)", "OPTIMAL"),
+        "amber": ("#e3b341", "rgba(227, 179, 65, 0.15)", "CAUTION"),
+        "red": ("#f85149", "rgba(248, 81, 73, 0.15)", "STRAIN"),
+        "blue": ("#58a6ff", "rgba(88, 166, 255, 0.14)", "CONTEXT"),
     }
     st.markdown(
         f'<div style="background:linear-gradient(135deg, {v_col}1f 0%, #12171f 100%);'
@@ -833,7 +833,7 @@ def _render_decision_dialog_body(res: dict):
     st.markdown(
         f'<div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:12px 14px;margin-top:10px;">'
         f'  <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#58a6ff;margin-bottom:4px;">'
-        f'    🎯 Today\'s Recommended Prescription'
+        f'    Today\'s Recommended Prescription'
         f'  </div>'
         f'  <div style="font-size:0.86rem;font-weight:600;color:#f0f6fc;line-height:1.4;">{res["prescription"]}</div>'
         f'</div>',
@@ -841,13 +841,13 @@ def _render_decision_dialog_body(res: dict):
     )
 
 
-@st.dialog("🏃 Can I Run Today? — Live Readiness & 5K Plan Check", width="large")
+@st.dialog("Can I Run Today? — Live Readiness & 5K Plan Check", width="large")
 def show_can_i_run_dialog():
     res = data.evaluate_daily_training_decision("run", body_state, ts, acts, hevy_workouts, hevy_sets)
     _render_decision_dialog_body(res)
 
 
-@st.dialog("🏋️ Can I Lift Today? — Live Readiness & PPL Split Check", width="large")
+@st.dialog("Can I Lift Today? — Live Readiness & PPL Split Check", width="large")
 def show_can_i_lift_dialog():
     res = data.evaluate_daily_training_decision("lift", body_state, ts, acts, hevy_workouts, hevy_sets)
     _render_decision_dialog_body(res)
@@ -855,10 +855,10 @@ def show_can_i_lift_dialog():
 
 btn_col1, btn_col2 = st.columns(2)
 with btn_col1:
-    if st.button("🏃 Can I run today?", key="btn_can_i_run", use_container_width=True, type="primary"):
+    if st.button("Can I run today?", key="btn_can_i_run", use_container_width=True, type="primary"):
         show_can_i_run_dialog()
 with btn_col2:
-    if st.button("🏋️ Can I lift today?", key="btn_can_i_lift", use_container_width=True, type="primary"):
+    if st.button("Can I lift today?", key="btn_can_i_lift", use_container_width=True, type="primary"):
         show_can_i_lift_dialog()
 
 
