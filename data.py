@@ -2560,3 +2560,265 @@ def compute_correlations_and_insights(
         "corr_labels": corr_cols,
         "body_state": body_state,
     }
+
+
+def evaluate_daily_training_decision(
+    mode: str,
+    body_state: dict,
+    ts: dict,
+    acts: pd.DataFrame,
+    hevy_workouts: pd.DataFrame,
+    hevy_sets: pd.DataFrame,
+) -> dict:
+    """Evaluate 'Can I run today?' (mode='run') or 'Can I lift today?' (mode='lift')
+    using live Garmin autonomic/sleep telemetry, Hevy lifting fatigue, and the 5K + PPL hybrid schedule."""
+    today_ts = pd.Timestamp(date.today()).normalize()
+    dow = today_ts.weekday()  # 0=Mon .. 6=Sun
+    day_name = today_ts.strftime("%A, %d %b %Y")
+
+    readiness = int(body_state.get("readiness_score") or 65)
+    hrv_now = body_state.get("hrv_now")
+    hrv_base = float(body_state.get("hrv_base") or 55.0)
+    hrv_low = float(body_state.get("hrv_low_band") or (hrv_base * 0.88))
+    hrv_below_days = int(body_state.get("hrv_below_days") or 0)
+    rhr_now = body_state.get("rhr_now")
+    rhr_base = float(body_state.get("rhr_base") or 54.0)
+    rhr_delta = (float(rhr_now) - rhr_base) if rhr_now is not None else 0.0
+    bb_now = body_state.get("bb_now")
+    bb_base = float(body_state.get("bb_base") or 80.0)
+    sl_score = body_state.get("sl_score_now")
+    sl_h = body_state.get("sl_h_now")
+    sl_stress = body_state.get("sl_stress_now")
+
+    acwr = float(ts.get("acwr") or 1.0)
+    acute_load = int(ts.get("acute_load") or 0)
+    opt_high = int(ts.get("opt_high") or 600)
+    ts_status = str(ts.get("status") or "Productive")
+
+    # Inspect recent runs
+    runs_today = pd.DataFrame()
+    last_run = None
+    days_since_run = None
+    if acts is not None and not acts.empty and "category" in acts.columns:
+        r_df = acts[acts["category"] == "Run"].copy()
+        if not r_df.empty:
+            r_df["dt"] = pd.to_datetime(r_df["date"], errors="coerce")
+            r_df["d_norm"] = r_df["dt"].dt.tz_localize(None).dt.normalize() if r_df["dt"].dt.tz is not None else r_df["dt"].dt.normalize()
+            r_df = r_df.sort_values("dt", ascending=False)
+            runs_today = r_df[r_df["d_norm"] == today_ts]
+            last_run = r_df.iloc[0]
+            days_since_run = int((today_ts - last_run["d_norm"]).days)
+
+    # Inspect recent Hevy workouts & 48h leg volume
+    lifts_today = pd.DataFrame()
+    last_lift = None
+    days_since_lift = None
+    if hevy_workouts is not None and not hevy_workouts.empty and "date" in hevy_workouts.columns:
+        hw = hevy_workouts.copy()
+        hw["dt"] = pd.to_datetime(hw["date"], errors="coerce")
+        hw["d_norm"] = hw["dt"].dt.normalize()
+        hw = hw.sort_values("dt", ascending=False)
+        lifts_today = hw[hw["d_norm"] == today_ts]
+        last_lift = hw.iloc[0]
+        days_since_lift = int((today_ts - last_lift["d_norm"]).days)
+
+    leg_sets_48h = 0
+    leg_vol_48h = 0.0
+    if hevy_sets is not None and not hevy_sets.empty and "date" in hevy_sets.columns:
+        hs = hevy_sets[hevy_sets["set_type"] != "warmup"].copy()
+        hs["d_norm"] = pd.to_datetime(hs["date"], errors="coerce").dt.normalize()
+        recent_hs = hs[hs["d_norm"] >= (today_ts - pd.Timedelta(days=2))]
+        leg_hs = recent_hs[
+            recent_hs["muscle_group"].isin(["Quadriceps", "Hamstrings & Glutes", "Calves"])
+            | recent_hs["exercise_title"].str.contains("Squat|Deadlift|Lunge|Hip Thrust|Glute|Calf|Leg", case=False, na=False)
+        ]
+        leg_sets_48h = int(len(leg_hs))
+        leg_vol_48h = float(leg_hs["volume_kg"].sum()) if not leg_hs.empty else 0.0
+
+    reasons = []
+
+    if mode == "run":
+        plan_map = {
+            0: ("Rest / Cross-Train (Push Gym Day)", "Non-run day on your 12-week 5K plan (reserves fresh legs for Tuesday Intervals)."),
+            1: ("Quality Intervals (5:15–5:28/km)", "Track/speed day: 400m–1000m repeats + 3 km warm-up/cooldown."),
+            2: ("Rest / Cross-Train (Pull Gym Day)", "Non-run recovery day between Tuesday Intervals and Thursday Tempo."),
+            3: ("Tempo / Threshold (5:48–5:56/km)", "Lactate-threshold session: 15–30 min tempo or cruise intervals."),
+            4: ("Easy Run + Strides (6:50–7:40/km)", "4–7 km aerobic Zone 2 + 4–6×100m neuromuscular strides."),
+            5: ("Rest / Leg Strength Day", "Non-run day ahead of Sunday's Long Run."),
+            6: ("Long Run (10–15 km)", "Endurance pillar; easy aerobic pace with fast finish (6:02–6:35/km) on build weeks."),
+        }
+        sched_title, sched_note = plan_map.get(dow, ("Run Session", ""))
+
+        # 1. Autonomic & Somatic Readiness reason
+        hrv_str = f"{hrv_now:.0f} ms (floor {hrv_low:.0f} ms)" if hrv_now is not None else "N/A"
+        rhr_str = f"{rhr_now:.0f} bpm ({rhr_delta:+.1f} vs {rhr_base:.0f} base)" if rhr_now is not None else "N/A"
+        if readiness >= 65 and rhr_delta < 3.5 and (hrv_now is None or hrv_now >= hrv_low):
+            reasons.append(("green", "Autonomic Readiness", f"Readiness is <b>{readiness}/100 ({body_state.get('state_badge')})</b> · HRV {hrv_str} · RHR {rhr_str}. Your cardiovascular and nervous systems are green-lit."))
+        elif readiness >= 42 and rhr_delta < 5.0:
+            reasons.append(("amber", "Autonomic Readiness", f"Readiness is moderate at <b>{readiness}/100 ({body_state.get('state_badge')})</b> · HRV {hrv_str} · RHR {rhr_str}. Suitable for easy aerobic running, but high-intensity intervals will carry extra HR drift."))
+        else:
+            reasons.append(("red", "Autonomic Strain Alert", f"Readiness is low at <b>{readiness}/100 ({body_state.get('state_badge')})</b> · HRV {hrv_str} ({hrv_below_days}d below floor) · RHR {rhr_str}. Sympathetic strain is elevated."))
+
+        # 2. Sleep & Body Battery reason
+        bb_str = f"{bb_now:.0f}/100 (base {bb_base:.0f})" if bb_now is not None else "N/A"
+        sl_str = f"{sl_h:.1f}h (Score {sl_score:.0f}/100)" if (sl_h is not None and sl_score is not None) else (f"{sl_h:.1f}h" if sl_h is not None else "N/A")
+        if (bb_now is None or bb_now >= 55) and (sl_score is None or sl_score >= 68):
+            reasons.append(("green", "Energy & Overnight Sleep", f"Morning Body Battery peaked at <b>{bb_str}</b> after <b>{sl_str}</b> sleep. Glycogen and central energy reserves support running today."))
+        elif (bb_now is None or bb_now >= 35) and (sl_h is None or sl_h >= 5.8):
+            reasons.append(("amber", "Suboptimal Recharge", f"Body Battery is <b>{bb_str}</b> with <b>{sl_str}</b> sleep. Keep effort conversational (Zone 1–2) and avoid max-effort sprints."))
+        else:
+            reasons.append(("red", "Depleted Energy / Sleep Debt", f"Body Battery peaked at only <b>{bb_str}</b> after <b>{sl_str}</b> sleep" + (f" (sleep stress {sl_stress:.0f}/100)." if sl_stress else ".") + " Running hard on this deficit risks overreaching."))
+
+        # 3. Leg-Day Interference & Recent Load
+        if leg_sets_48h >= 4:
+            reasons.append(("amber", "48h Hevy Leg-Day Interference", f"You logged <b>{leg_sets_48h} working leg sets ({leg_vol_48h:,.0f} kg)</b> in the last 48h. Expect ~3–5 bpm higher HR at normal pace; favor easy Zone 2 over fast track intervals."))
+        else:
+            reasons.append(("green", "Fresh Lower-Body Musculature", "Zero heavy Hevy leg volume logged in the past 48 hours — your quads, hamstrings, and calves have no lifting interference."))
+
+        # 4. Acute Load / ACWR & Today's Activity Check
+        if not runs_today.empty:
+            rt = runs_today.iloc[0]
+            reasons.append(("amber", "Already Ran Today", f"You already completed <b>{rt['name']} ({rt['distance_km']:.2f} km, {rt['duration_min']:.0f} min)</b> today. A second run is unnecessary on your 5K plan."))
+        elif last_run is not None:
+            reasons.append(("blue", "Recent Running & ACWR Load", f"Last run: <b>{last_run['name']} ({last_run['distance_km']:.1f} km)</b> {days_since_run}d ago · 7d Load <b>{acute_load}</b> (ACWR <b>{acwr:.2f}x</b> · {ts_status})."))
+
+        reasons.append(("blue", f"5K Plan Schedule ({today_ts.strftime('%A')})", f"<b>{sched_title}</b> — {sched_note}"))
+
+        # Determine final Verdict for Running
+        if not runs_today.empty:
+            verdict = "NO — ALREADY RAN TODAY"
+            short_answer = "NO"
+            color = "#e3b341"
+            summary = f"You already logged <b>{runs_today.iloc[0]['distance_km']:.2f} km</b> today. Prioritize hydration, carbohydrates, and recovery so your legs are fresh for your next session."
+            prescription = "Rest & recover for the remainder of the day (optional 10-min mobility or light walk)."
+        elif readiness < 38 or (bb_now is not None and bb_now < 32) or rhr_delta >= 5.5 or acwr > 1.45:
+            verdict = "NO — REST DAY RECOMMENDED"
+            short_answer = "NO"
+            color = "#f85149"
+            summary = "Your autonomic biomarkers show acute fatigue and incomplete overnight recovery. Running today will deepen sympathetic strain rather than build aerobic fitness."
+            prescription = f"Take a full rest day (or 20–30 min easy walk). Wait until RHR drops ≤{rhr_base + 2:.0f} bpm and Body Battery ≥55."
+        elif readiness < 58 or (bb_now is not None and bb_now < 52) or leg_sets_48h >= 6 or acwr > 1.25:
+            verdict = "YES — EASY ZONE 2 ONLY (MODIFY INTENSITY)"
+            short_answer = "YES (EASY ONLY)"
+            color = "#e3b341"
+            summary = "You can run today, but your recovery reserves or recent leg loading call for an intensity cap. Swap any hard intervals/tempo for a relaxed aerobic run."
+            prescription = "Run 4–6 km Easy @ 6:50–7:40/km (keep HR < 152 bpm, conversational effort) and finish before 17:30."
+        elif dow in (0, 2, 5):
+            verdict = "YES — OPTIONAL EASY RECOVERY JOG (NON-RUN DAY)"
+            short_answer = "YES (OPTIONAL)"
+            color = "#39d353"
+            summary = f"Your physiology is well-recovered (<b>Readiness {readiness}/100</b>), though {today_ts.strftime('%A')} is a scheduled PPL gym / non-running day on your 5K plan."
+            prescription = f"Stick to your PPL gym session today to keep Tuesday/Thursday runs 100% fresh, or cap any shakeout jog at 3–5 km Easy (6:55–7:40/km)."
+        else:
+            verdict = "YES — GREEN LIGHT FOR PLANNED RUN"
+            short_answer = "YES"
+            color = "#39d353"
+            summary = f"All physiological systems are go (<b>Readiness {readiness}/100</b>, RHR {rhr_now or rhr_base:.0f} bpm, Body Battery {bb_now or bb_base:.0f}/100). Execute today's scheduled 5K plan workout."
+            prescription = f"Execute {today_ts.strftime('%A')}'s session: {sched_title}."
+
+    else:  # mode == "lift"
+        ppl_map = {
+            0: ("PUSH Day (Chest, Shoulders, Triceps, Core)", "18 working sets @ RPE 8 · Zero leg/lower-back fatigue 24h before Tuesday Intervals."),
+            1: ("Rest from Gym (5K Quality Intervals Day)", "Protect CNS and legs for today's 5:15–5:28/km track repeats."),
+            2: ("PULL Day (Lats, Upper Back, Biceps, Obliques)", "17 working sets @ RPE 8 · Avoid axial deadlifts so hamstrings/back are fresh for Thursday Tempo."),
+            3: ("Rest from Gym (5K Tempo Day)", "Optional: Legs 4–6h AFTER Tempo if using 'Hard Days Hard' Option B."),
+            4: ("Rest or Option B LEGS (After Easy Run)", "If running fast-finish long run on Sunday, do Legs today after your Easy run."),
+            5: ("LEGS Day (Squat, RDL, Lunge, Hip Thrust, Calf)", "14–15 working sets · Low-rep (4–8 reps @ RPE ≤8, stop 2 reps shy of failure)."),
+            6: ("Rest from Gym (5K Long Run Day)", "10–15 km aerobic long run takes priority today; avoid lifting."),
+        }
+        sched_title, sched_note = ppl_map.get(dow, ("Strength Session", ""))
+
+        # 1. Readiness & Autonomic state
+        hrv_str = f"{hrv_now:.0f} ms" if hrv_now is not None else "N/A"
+        rhr_str = f"{rhr_now:.0f} bpm ({rhr_delta:+.1f} bpm)" if rhr_now is not None else "N/A"
+        if readiness >= 62 and rhr_delta < 3.5:
+            reasons.append(("green", "CNS & Autonomic Readiness", f"Readiness is <b>{readiness}/100 ({body_state.get('state_badge')})</b> · HRV {hrv_str} · RHR {rhr_str}. Central nervous system recruitment is primed for progressive overload."))
+        elif readiness >= 40 and rhr_delta < 5.0:
+            reasons.append(("amber", "Moderate CNS Recovery", f"Readiness is <b>{readiness}/100 ({body_state.get('state_badge')})</b> · HRV {hrv_str} · RHR {rhr_str}. You can lift, but trim 1 set per exercise and avoid grinding to failure."))
+        else:
+            reasons.append(("red", "High Autonomic Strain", f"Readiness is <b>{readiness}/100 ({body_state.get('state_badge')})</b> · HRV {hrv_str} · RHR {rhr_str}. Heavy compound lifting today will compound systemic fatigue."))
+
+        # 2. Body Battery & Tonnage Capacity
+        bb_str = f"{bb_now:.0f}/100" if bb_now is not None else "N/A"
+        sl_str = f"{sl_h:.1f}h (Score {sl_score:.0f})" if (sl_h is not None and sl_score is not None) else "N/A"
+        if (bb_now is None or bb_now >= 52) and (sl_score is None or sl_score >= 65):
+            reasons.append(("green", "Body Battery & Gym Tonnage Reserve", f"Morning Body Battery is <b>{bb_str}</b> with <b>{sl_str}</b> sleep. Your telemetry shows full tonnage capacity when Body Battery starts ≥55."))
+        elif (bb_now is None or bb_now >= 34):
+            reasons.append(("amber", "Reduced Energy Reserve", f"Body Battery peaked at <b>{bb_str}</b> ({sl_str} sleep). Expect ~10–15% lower volume tolerance; cap sets at RPE 7.5."))
+        else:
+            reasons.append(("red", "Severely Depleted Body Battery", f"Body Battery peaked at just <b>{bb_str}</b> ({sl_str} sleep). Skip heavy resistance training today and prioritize sleep."))
+
+        # 3. Recent Hevy Workout & Muscle Group Recovery
+        if not lifts_today.empty:
+            lt = lifts_today.iloc[0]
+            reasons.append(("amber", "Already Lifted Today", f"You already logged <b>{lt['title']} ({lt['volume_kg']:,.0f} kg, {lt['working_sets']} sets)</b> today."))
+        elif last_lift is not None:
+            reasons.append(("blue", "Recent Hevy Recovery Window", f"Last gym session: <b>{last_lift['title']}</b> ({last_lift['volume_kg']:,.0f} kg · {last_lift.get('primary_muscles', 'Full Body')}) <b>{days_since_lift}d ago</b>."))
+        else:
+            reasons.append(("green", "Fresh Muscular Baseline", "No recent Hevy fatigue logged in the last 72 hours — all muscle groups are 100% recovered."))
+
+        # 4. 5K Plan Protection Rule
+        if dow == 0:
+            reasons.append(("green", "Tuesday Interval Protection", "Monday is your designated <b>PUSH</b> day — upper-body pressing leaves your legs 100% fresh for tomorrow's 5:15/km intervals."))
+        elif dow == 2:
+            reasons.append(("green", "Thursday Tempo Protection", "Wednesday is your designated <b>PULL</b> day — upper-back &amp; bicep work spares your legs and lower back for tomorrow's Tempo run."))
+        elif dow in (4, 5):
+            reasons.append(("green", "72h Speedwork Buffer", f"{today_ts.strftime('%A')} is your ideal <b>LEGS</b> window — gives 72–96h recovery before Tuesday's fast intervals."))
+        else:
+            reasons.append(("amber", f"5K Key Run Day ({today_ts.strftime('%A')})", f"Today is a key running day (<b>{sched_title}</b>). Avoid heavy lower-body lifting today; if lifting upper body, do it ≥4h after your run."))
+
+        # Determine final Verdict for Lifting
+        if not lifts_today.empty:
+            verdict = "NO — ALREADY LIFTED TODAY"
+            short_answer = "NO"
+            color = "#e3b341"
+            summary = f"You already completed <b>{lifts_today.iloc[0]['title']} ({lifts_today.iloc[0]['volume_kg']:,.0f} kg)</b> today. Let muscle protein synthesis and recovery take over."
+            prescription = "Hit your daily protein target (1.6–2.0 g/kg) and rest until your next scheduled session."
+        elif readiness < 36 or (bb_now is not None and bb_now < 30) or rhr_delta >= 5.5:
+            verdict = "NO — REST & RECOVER TODAY"
+            short_answer = "NO"
+            color = "#f85149"
+            summary = "Your autonomic nervous system and Body Battery are too depleted for productive strength training today. Lifting in this state elevates cortisol and stalls both 5K and gym progress."
+            prescription = "Skip the gym today. Focus on hydration, carbs, and an early bedtime before 22:30."
+        elif dow in (1, 3, 6) and readiness < 68:
+            verdict = "NO — PRIORITIZE TODAY'S 5K RUN"
+            short_answer = "NO (RUN PRIORITY)"
+            color = "#e3b341"
+            summary = f"{today_ts.strftime('%A')} is a key 5K running day and your readiness is moderate (<b>{readiness}/100</b>). Save your recovery reserves for your run and lift on Mon/Wed/Sat."
+            prescription = f"Skip lifting today; focus on your scheduled {today_ts.strftime('%A')} run and lift tomorrow."
+        elif readiness < 56 or (bb_now is not None and bb_now < 50):
+            verdict = "YES — AUTOREGULATED DELOAD (-1 SET / RPE 7.5)"
+            short_answer = "YES (LIGHT / DELOAD)"
+            color = "#e3b341"
+            summary = f"You can lift today, but with Body Battery at <b>{bb_now or 50:.0f}/100</b> and Readiness at <b>{readiness}/100</b>, use your PDF plan's Autoregulation Guardrail."
+            prescription = f"Run {sched_title}, but trim 1 working set per exercise (2–3 sets/ex), cap effort at RPE 7–7.5 (2–3 reps in reserve), and finish before 17:30."
+        elif dow in (1, 3, 6):
+            verdict = "YES — UPPER BODY ONLY (AFTER YOUR RUN)"
+            short_answer = "YES (UPPER ONLY)"
+            color = "#39d353"
+            summary = f"Your physiology is charged (<b>Readiness {readiness}/100</b>), though today is a scheduled 5K run day ({today_ts.strftime('%A')})."
+            prescription = "Complete your scheduled run first. If you also lift today, stick strictly to Push or Pull (zero squats/RDLs) and finish before 17:30."
+        else:
+            verdict = "YES — GREEN LIGHT FOR FULL PPL SESSION"
+            short_answer = "YES"
+            color = "#39d353"
+            summary = f"Readiness (<b>{readiness}/100</b>), HRV (<b>{hrv_str}</b>), and Body Battery (<b>{bb_str}</b>) are well within your optimal training zone."
+            prescription = f"Execute {sched_title} — {sched_note}"
+
+    return {
+        "mode": mode,
+        "day_name": day_name,
+        "verdict": verdict,
+        "short_answer": short_answer,
+        "color": color,
+        "summary": summary,
+        "prescription": prescription,
+        "reasons": reasons,
+        "readiness": readiness,
+        "hrv_now": hrv_now,
+        "rhr_now": rhr_now,
+        "bb_now": bb_now,
+        "sl_score": sl_score,
+        "acwr": acwr,
+    }
+

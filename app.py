@@ -17,6 +17,7 @@ if (
     or not hasattr(data, "compute_correlations_and_insights")
     or not hasattr(data, "compute_body_state_now")
     or not hasattr(data, "compute_race_predictions")
+    or not hasattr(data, "evaluate_daily_training_decision")
 ):
     data = importlib.reload(data)
     data._LOADED_MTIME = _data_mtime
@@ -469,6 +470,30 @@ header[data-testid="stHeader"] {{
     font-size: 0.7rem;
     color: #8b949e;
 }}
+
+/* Readiness Action Buttons ("Can I run today?" / "Can I lift today?") */
+div[data-testid="stButton"] > button[kind="primary"] {{
+    background: linear-gradient(135deg, #161b22 0%, #1c2430 100%) !important;
+    border: 1px solid #30363d !important;
+    color: #f0f6fc !important;
+    font-weight: 700 !important;
+    font-size: 0.92rem !important;
+    border-radius: 12px !important;
+    padding: 10px 18px !important;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3) !important;
+    transition: all 0.18s ease !important;
+}}
+div[data-testid="stButton"] > button[kind="primary"]:hover {{
+    border-color: #58a6ff !important;
+    background: linear-gradient(135deg, #1c2430 0%, #222d3d 100%) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(88, 166, 255, 0.18) !important;
+}}
+div[role="dialog"] {{
+    background: #0d1117 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 16px !important;
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -728,6 +753,114 @@ st.markdown(
     f'</div>',
     unsafe_allow_html=True,
 )
+
+
+# --------------------------------------------------------------- Daily Readiness Decision Popups ("Can I run today?" / "Can I lift today?")
+def _render_decision_dialog_body(res: dict):
+    v_col = res["color"]
+    badge_map = {
+        "green": ("#39d353", "rgba(57, 211, 83, 0.14)", "✓ OPTIMAL"),
+        "amber": ("#e3b341", "rgba(227, 179, 65, 0.15)", "⚠ CAUTION"),
+        "red": ("#f85149", "rgba(248, 81, 73, 0.15)", "✕ STRAIN"),
+        "blue": ("#58a6ff", "rgba(88, 166, 255, 0.14)", "ℹ CONTEXT"),
+    }
+    st.markdown(
+        f'<div style="background:linear-gradient(135deg, {v_col}1f 0%, #12171f 100%);'
+        f'border:1px solid {v_col}66;border-left:5px solid {v_col};border-radius:12px;padding:16px 18px;margin-bottom:14px;">'
+        f'  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">'
+        f'    <span style="font-size:0.74rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#8b949e;">{res["day_name"]} · Live Telemetry Verdict</span>'
+        f'    <span style="background:{v_col}28;color:{v_col};border:1px solid {v_col}66;padding:3px 10px;border-radius:999px;font-size:0.74rem;font-weight:800;">'
+        f'      Readiness {res["readiness"]}/100'
+        f'    </span>'
+        f'  </div>'
+        f'  <div style="font-size:1.35rem;font-weight:800;color:{v_col};margin:6px 0 4px 0;letter-spacing:-0.01em;">{res["verdict"]}</div>'
+        f'  <div style="font-size:0.88rem;color:#e6edf3;line-height:1.45;">{res["summary"]}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Mini telemetry strip
+    hrv_txt = f"{res['hrv_now']:.0f} ms" if res.get("hrv_now") is not None else "–"
+    rhr_txt = f"{res['rhr_now']:.0f} bpm" if res.get("rhr_now") is not None else "–"
+    bb_txt = f"{res['bb_now']:.0f}/100" if res.get("bb_now") is not None else "–"
+    sl_txt = f"{res['sl_score']:.0f}/100" if res.get("sl_score") is not None else "–"
+    acwr_txt = f"{res['acwr']:.2f}x" if res.get("acwr") is not None else "–"
+    st.markdown(
+        f'<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:14px;">'
+        f'  <div style="background:#161b22;border:1px solid #262c36;border-radius:9px;padding:8px 10px;text-align:center;">'
+        f'    <div style="font-size:0.66rem;color:#8b949e;text-transform:uppercase;">HRV Nightly</div>'
+        f'    <div style="font-family:\'JetBrains Mono\',monospace;font-size:0.95rem;font-weight:700;color:#f0f6fc;">{hrv_txt}</div>'
+        f'  </div>'
+        f'  <div style="background:#161b22;border:1px solid #262c36;border-radius:9px;padding:8px 10px;text-align:center;">'
+        f'    <div style="font-size:0.66rem;color:#8b949e;text-transform:uppercase;">Resting HR</div>'
+        f'    <div style="font-family:\'JetBrains Mono\',monospace;font-size:0.95rem;font-weight:700;color:#f0f6fc;">{rhr_txt}</div>'
+        f'  </div>'
+        f'  <div style="background:#161b22;border:1px solid #262c36;border-radius:9px;padding:8px 10px;text-align:center;">'
+        f'    <div style="font-size:0.66rem;color:#8b949e;text-transform:uppercase;">Body Battery</div>'
+        f'    <div style="font-family:\'JetBrains Mono\',monospace;font-size:0.95rem;font-weight:700;color:#f0f6fc;">{bb_txt}</div>'
+        f'  </div>'
+        f'  <div style="background:#161b22;border:1px solid #262c36;border-radius:9px;padding:8px 10px;text-align:center;">'
+        f'    <div style="font-size:0.66rem;color:#8b949e;text-transform:uppercase;">Sleep Score</div>'
+        f'    <div style="font-family:\'JetBrains Mono\',monospace;font-size:0.95rem;font-weight:700;color:#f0f6fc;">{sl_txt}</div>'
+        f'  </div>'
+        f'  <div style="background:#161b22;border:1px solid #262c36;border-radius:9px;padding:8px 10px;text-align:center;">'
+        f'    <div style="font-size:0.66rem;color:#8b949e;text-transform:uppercase;">Load ACWR</div>'
+        f'    <div style="font-family:\'JetBrains Mono\',monospace;font-size:0.95rem;font-weight:700;color:#f0f6fc;">{acwr_txt}</div>'
+        f'  </div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div style="font-size:0.8rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:#8b949e;margin-bottom:8px;">'
+        'Why? Multi-Factor Physiological & Schedule Reasoning</div>',
+        unsafe_allow_html=True,
+    )
+    for level, title, detail in res["reasons"]:
+        fg, bg, pill_txt = badge_map.get(level, badge_map["blue"])
+        st.markdown(
+            f'<div style="background:#141921;border:1px solid #262c36;border-left:3px solid {fg};'
+            f'border-radius:10px;padding:10px 13px;margin-bottom:8px;">'
+            f'  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px;">'
+            f'    <span style="font-weight:700;font-size:0.86rem;color:#f0f6fc;">{title}</span>'
+            f'    <span style="background:{bg};color:{fg};padding:2px 8px;border-radius:999px;font-size:0.68rem;font-weight:700;">{pill_txt}</span>'
+            f'  </div>'
+            f'  <div style="font-size:0.81rem;color:#c9d1d9;line-height:1.42;">{detail}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        f'<div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:12px 14px;margin-top:10px;">'
+        f'  <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#58a6ff;margin-bottom:4px;">'
+        f'    🎯 Today\'s Recommended Prescription'
+        f'  </div>'
+        f'  <div style="font-size:0.86rem;font-weight:600;color:#f0f6fc;line-height:1.4;">{res["prescription"]}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+@st.dialog("🏃 Can I Run Today? — Live Readiness & 5K Plan Check", width="large")
+def show_can_i_run_dialog():
+    res = data.evaluate_daily_training_decision("run", body_state, ts, acts, hevy_workouts, hevy_sets)
+    _render_decision_dialog_body(res)
+
+
+@st.dialog("🏋️ Can I Lift Today? — Live Readiness & PPL Split Check", width="large")
+def show_can_i_lift_dialog():
+    res = data.evaluate_daily_training_decision("lift", body_state, ts, acts, hevy_workouts, hevy_sets)
+    _render_decision_dialog_body(res)
+
+
+btn_col1, btn_col2 = st.columns(2)
+with btn_col1:
+    if st.button("🏃 Can I run today?", key="btn_can_i_run", use_container_width=True, type="primary"):
+        show_can_i_run_dialog()
+with btn_col2:
+    if st.button("🏋️ Can I lift today?", key="btn_can_i_lift", use_container_width=True, type="primary"):
+        show_can_i_lift_dialog()
+
 
 
 # --------------------------------------------------------------- GitHub-Style Heatmap
