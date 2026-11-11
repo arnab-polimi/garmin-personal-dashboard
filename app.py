@@ -521,14 +521,17 @@ def pace(speed_kmh):
 
 
 # --------------------------------------------------------------- Data Loading
+CACHE_SCHEMA_VERSION = "v4_naps_202bpm"
+
+
 @st.cache_data(ttl=3600, show_spinner="Syncing Garmin Personal API…")
-def load_official_api(api_key: str, access_token: str, days: int):
+def load_official_api(api_key: str, access_token: str, days: int, schema_ver: str = CACHE_SCHEMA_VERSION):
     client = data.GarminPersonalAPIClient(api_key=api_key, access_token=access_token)
     return data.fetch_official_api(client, days)
 
 
 @st.cache_data(ttl=3600, show_spinner="Syncing Garmin Connect…")
-def load_legacy(email: str, password: str, tokens: str, days: int):
+def load_legacy(email: str, password: str, tokens: str, days: int, schema_ver: str = CACHE_SCHEMA_VERSION):
     g = data.login(email, password, tokens)
     return data.fetch_live(g, days)
 
@@ -593,9 +596,12 @@ try:
     if demo_mode or not (active_api_key or secret_access_token or has_legacy_secrets):
         D = data.demo(days)
     elif active_api_key or secret_access_token:
-        D = load_official_api(active_api_key, secret_access_token, days)
+        D = load_official_api(active_api_key, secret_access_token, days, CACHE_SCHEMA_VERSION)
+        if "naps" not in D or ("sleep" in D and not D["sleep"].empty and "nap_min" not in D["sleep"].columns):
+            st.cache_data.clear()
+            D = load_official_api(active_api_key, secret_access_token, days, CACHE_SCHEMA_VERSION)
     elif has_legacy_secrets:
-        D = load_legacy(cfg.get("email"), cfg.get("password"), cfg.get("tokens"), days)
+        D = load_legacy(cfg.get("email"), cfg.get("password"), cfg.get("tokens"), days, CACHE_SCHEMA_VERSION)
 except Exception as e:
     st.error(f"Could not load Garmin data: {e}")
     st.info("Check your Personal API Key in `.streamlit/secrets.toml` (see `README.md`) or switch on Demo data in the sidebar.")

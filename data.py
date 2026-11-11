@@ -296,6 +296,9 @@ class GarminPersonalAPIClient:
         self.access_token = (access_token or "").strip() or None
         self.token_expires_at = 0.0
         self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.session.headers.update({"Accept": "*/*"})
 
     def authenticate(self) -> str:
@@ -339,24 +342,39 @@ class GarminPersonalAPIClient:
     def get(self, path: str, params: dict | None = None):
         token = self.authenticate()
         url = path if path.startswith("http") else f"{BASE_URL}{path}"
-        resp = self.session.get(
-            url,
-            params=params,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=25,
-        )
-        if resp.status_code == 401 and self.api_key:
-            # Token expired early; re-exchange once
-            self.token_expires_at = 0
-            token = self.authenticate()
-            resp = self.session.get(
-                url,
-                params=params,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=25,
-            )
-        resp.raise_for_status()
-        return resp.json() if resp.content else None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                resp = self.session.get(
+                    url,
+                    params=params,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=25,
+                )
+                if resp.status_code == 401 and self.api_key:
+                    # Token expired early; re-exchange once
+                    self.token_expires_at = 0
+                    token = self.authenticate()
+                    resp = self.session.get(
+                        url,
+                        params=params,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=25,
+                    )
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                return resp.json() if resp.content else None
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        return None
 
 
 def _parse_activities(raw_list: list) -> pd.DataFrame:
