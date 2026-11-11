@@ -628,6 +628,7 @@ except Exception as e:
 acts, sleep, hrv, daily, vo2, preds = (
     D[k] for k in ["activities", "sleep", "hrv", "daily", "vo2max", "predictions"]
 )
+naps = D.get("naps", pd.DataFrame())
 all_acts = D.get("all_activities", acts)
 hevy_workouts = H.get("workouts", pd.DataFrame())
 hevy_sets = H.get("sets", pd.DataFrame())
@@ -1304,7 +1305,7 @@ with tabs[5]:
     if sleep.empty:
         st.info("No sleep data available for this period.")
     else:
-        c = st.columns(5)
+        c = st.columns(6)
         kpi_card(c[0], "Avg Sleep", f"{sleep.total_h.mean():.2f} h", f"{len(sleep)} nights tracked", "sleep", "#a371f7")
         kpi_card(
             c[1],
@@ -1317,6 +1318,16 @@ with tabs[5]:
         kpi_card(c[2], "Deep Sleep", f"{sleep.deep_h.mean() * 60:.0f} min", f"{sleep.deep_h.mean() / sleep.total_h.mean() * 100:.0f}% of total", "recovery", "#1f6feb")
         kpi_card(c[3], "REM Sleep", f"{sleep.rem_h.mean() * 60:.0f} min", f"{sleep.rem_h.mean() / sleep.total_h.mean() * 100:.0f}% of total", "insights", "#a371f7")
         kpi_card(c[4], "Light / Awake", f"{sleep.light_h.mean():.1f} h", f"Awake avg {sleep.awake_h.mean() * 60:.0f} min", "curious", "#58a6ff")
+        tot_naps_cnt = int(len(naps)) if isinstance(naps, pd.DataFrame) and not naps.empty else int(sleep["nap_count"].sum() if "nap_count" in sleep.columns else 0)
+        tot_nap_m = float(naps["duration_min"].sum()) if isinstance(naps, pd.DataFrame) and not naps.empty else float(sleep["nap_min"].sum() if "nap_min" in sleep.columns else 0.0)
+        kpi_card(
+            c[5],
+            "Daytime Naps",
+            f"{tot_naps_cnt} naps" if tot_naps_cnt > 0 else "0 naps",
+            f"{tot_nap_m:.0f} min total · Avg {tot_nap_m / tot_naps_cnt:.0f} min" if tot_naps_cnt > 0 else "No naps in selected window",
+            "sleep",
+            "#e3b341" if tot_naps_cnt > 0 else "#8b949e",
+        )
 
         section_header("Sleep Consistency", "Nightly sleep duration across the past year", "sleep", "#a371f7")
         sdf = sleep.assign(day=sleep.date, hours=sleep.total_h)
@@ -1342,6 +1353,136 @@ with tabs[5]:
             sfig.add_trace(go.Scatter(x=sc["date"], y=sc["roll7"], mode="lines", name="7-day avg", line=dict(color="#a371f7", width=2.8)))
             sfig.update_layout(title="Garmin Sleep Score Trend")
             st.plotly_chart(layout(sfig, 300), width="stretch")
+
+        # ------------------------------------------------------- Naps & Garmin Sleep Coach Section
+        section_header(
+            "Naps & Daytime Recovery (Garmin Nap Detection & Sleep Coach)",
+            "Recorded daytime naps, Body Battery recharge impact, and Garmin Sleep Coach need adjustments",
+            "sleep",
+            "#e3b341",
+        )
+        latest_sl = sleep.sort_values("date").iloc[-1]
+        next_need_m = float(latest_sl.get("next_sleep_need_min") or latest_sl.get("sleep_need_min") or 480.0) if pd.notna(latest_sl.get("next_sleep_need_min") or latest_sl.get("sleep_need_min")) else 480.0
+        base_need_m = float(latest_sl.get("baseline_need_min") or 480.0) if pd.notna(latest_sl.get("baseline_need_min")) else 480.0
+        nap_adj_str = str(latest_sl.get("nap_adjustment") or "NO_CHANGE").replace("_", " ").title()
+        nh_h, nh_m = divmod(int(round(next_need_m)), 60)
+        bh_h, bh_m = divmod(int(round(base_need_m)), 60)
+
+        nc = st.columns(4)
+        if isinstance(naps, pd.DataFrame) and not naps.empty:
+            latest_nap = naps.sort_values("start_local", ascending=False).iloc[0]
+            ln_date = pd.to_datetime(latest_nap["date"]).strftime("%d %b %Y")
+            ln_window = (
+                f"{pd.to_datetime(latest_nap['start_local']):%H:%M}–{pd.to_datetime(latest_nap['end_local']):%H:%M}"
+                if pd.notna(latest_nap.get("start_local")) and pd.notna(latest_nap.get("end_local"))
+                else ln_date
+            )
+            ln_bb = latest_nap.get("bb_impact")
+            ln_bb_str = f"{int(ln_bb):+d} Body Battery" if pd.notna(ln_bb) else "Body Battery tracked"
+            bb_vals = naps["bb_impact"].dropna() if "bb_impact" in naps.columns else pd.Series(dtype=float)
+            net_bb = int(bb_vals.sum()) if not bb_vals.empty else 0
+
+            kpi_card(
+                nc[0],
+                "Latest Nap",
+                f"{latest_nap['duration_min']:.0f} min",
+                f"{ln_date} ({ln_window}) · {latest_nap.get('source', 'Watch')}",
+                "sleep",
+                "#e3b341",
+            )
+            kpi_card(
+                nc[1],
+                "Latest Nap Assessment",
+                "Ideal Power Nap" if "Ideal" in str(latest_nap.get("feedback", "")) else "Extended Nap",
+                str(latest_nap.get("feedback") or "Recorded nap"),
+                "optimalhealth",
+                "#39d353" if "Ideal" in str(latest_nap.get("feedback", "")) else "#e3b341",
+            )
+            kpi_card(
+                nc[2],
+                "Nap Body Battery Impact",
+                f"{int(ln_bb):+d} pts" if pd.notna(ln_bb) else f"{net_bb:+d} pts",
+                f"Latest nap ({ln_date}) · Window net {net_bb:+d} BB",
+                "calories",
+                "#39d353" if (pd.notna(ln_bb) and ln_bb > 0) else "#58a6ff",
+            )
+        else:
+            kpi_card(nc[0], "Latest Nap", "None", "No daytime naps logged in this range", "sleep", "#8b949e")
+            kpi_card(nc[1], "Nap Guidance", "15–25 min", "Ideal power nap window before 15:00 local", "optimalhealth", "#39d353")
+            kpi_card(nc[2], "Nap Body Battery", "0 pts", "Naps recharge Body Battery & reduce sleep debt", "calories", "#58a6ff")
+
+        kpi_card(
+            nc[3],
+            "Tonight's Sleep Coach Need",
+            f"{nh_h}h {nh_m:02d}m",
+            f"Baseline {bh_h}h {bh_m:02d}m · Nap adj: {nap_adj_str}",
+            "recovery",
+            "#f85149" if next_need_m >= 520 else ("#e3b341" if next_need_m > base_need_m else "#39d353"),
+        )
+
+        nl_col, nr_col = st.columns([1.15, 1])
+        with nl_col:
+            sl_plot = sleep.sort_values("date").copy()
+            sl_plot["nap_h"] = (sl_plot["nap_min"] / 60.0) if "nap_min" in sl_plot.columns else 0.0
+            sl_plot["need_h"] = (sl_plot["sleep_need_min"] / 60.0) if "sleep_need_min" in sl_plot.columns and sl_plot["sleep_need_min"].notna().any() else 8.0
+            nfig = go.Figure()
+            nfig.add_trace(
+                go.Bar(
+                    x=sl_plot["date"],
+                    y=sl_plot["total_h"],
+                    name="Night Sleep (h)",
+                    marker_color="#a371f7",
+                )
+            )
+            if sl_plot["nap_h"].sum() > 0:
+                nfig.add_trace(
+                    go.Bar(
+                        x=sl_plot["date"],
+                        y=sl_plot["nap_h"],
+                        name="Daytime Nap (h)",
+                        marker_color="#e3b341",
+                    )
+                )
+            nfig.add_trace(
+                go.Scatter(
+                    x=sl_plot["date"],
+                    y=sl_plot["need_h"],
+                    mode="lines+markers",
+                    name="Garmin Sleep Coach Need (h)",
+                    line=dict(color="#58a6ff", width=2.2, dash="dot"),
+                    marker=dict(size=5, color="#58a6ff"),
+                )
+            )
+            nfig.update_layout(
+                title="Night Sleep + Daytime Naps vs. Garmin Sleep Coach Need (hours)",
+                barmode="stack",
+            )
+            st.plotly_chart(layout(nfig, 320), width="stretch")
+
+        with nr_col:
+            if isinstance(naps, pd.DataFrame) and not naps.empty:
+                nap_tbl_rows = []
+                for _, nr in naps.sort_values("start_local", ascending=False).iterrows():
+                    st_t = pd.to_datetime(nr.get("start_local"))
+                    en_t = pd.to_datetime(nr.get("end_local"))
+                    win_s = f"{st_t:%H:%M} – {en_t:%H:%M}" if pd.notna(st_t) and pd.notna(en_t) else "–"
+                    bb_v = nr.get("bb_impact")
+                    bb_s = f"{int(bb_v):+d} BB" if pd.notna(bb_v) else "–"
+                    ns_h = nr.get("night_sleep_h")
+                    sc_v = nr.get("sleep_score")
+                    ns_str = f"{ns_h:.1f} h (Score {sc_v:.0f})" if pd.notna(ns_h) and pd.notna(sc_v) else (f"{ns_h:.1f} h" if pd.notna(ns_h) else "–")
+                    nap_tbl_rows.append({
+                        "Date": pd.to_datetime(nr["date"]).strftime("%d %b %Y"),
+                        "Time (Local)": win_s,
+                        "Duration": f"{nr['duration_min']:.0f} min",
+                        "BB Impact": bb_s,
+                        "Night Sleep": ns_str,
+                        "Garmin Nap Feedback": nr.get("feedback") or "Recorded nap",
+                        "Source": nr.get("source") or "Watch",
+                    })
+                st.dataframe(pd.DataFrame(nap_tbl_rows), width="stretch", hide_index=True)
+            else:
+                st.info("No naps recorded in the selected date window. Increase the date window in the sidebar or log a nap on your Garmin watch to see nap timing, Body Battery impact, and Sleep Coach adjustments.")
 
 # --------------------------------------------------------------- 6. Recovery & Fitness
 with tabs[6]:

@@ -472,6 +472,26 @@ def _format_feedback_code(code: str | None) -> str:
     return mapping.get(c, c.replace("_", " ").capitalize())
 
 
+def _format_nap_feedback(code: str | None) -> str:
+    if not code or str(code).upper() in ("NONE", "NULL", "UNKNOWN"):
+        return "Recorded nap"
+    mapping = {
+        "IDEAL_TIMING_IDEAL_DURATION_LOW_NEED": "Ideal timing & duration (~20 min power nap)",
+        "IDEAL_TIMING_IDEAL_DURATION_HIGH_NEED": "Ideal power nap timing & duration (high sleep need)",
+        "IDEAL_TIMING_SHORT_DURATION_LOW_NEED": "Ideal timing, light short nap",
+        "IDEAL_TIMING_LONG_DURATION_LOW_NEED": "Good timing, long duration (>30 min)",
+        "LONG_DURATION_LOW_NEED": "Long nap (>30 min — may cause grogginess / reduce tonight's sleep drive)",
+        "LONG_DURATION_HIGH_NEED": "Extended recovery nap (high sleep debt)",
+        "LATE_TIMING_IDEAL_DURATION_LOW_NEED": "Late-day nap (may delay tonight's sleep onset)",
+        "LATE_TIMING_LONG_DURATION_LOW_NEED": "Late & long nap (may impact overnight sleep quality)",
+        "NAP_RECOVERING_BODY_BATTERY_INCREASE": "Restful nap (+Body Battery recharge)",
+        "RESTFUL_NAP": "Restful nap",
+        "RESTFUL_PERIOD": "Restful daytime recovery period",
+    }
+    c = str(code).strip()
+    return mapping.get(c, c.replace("_", " ").capitalize())
+
+
 def compute_body_state_now(
     acts: pd.DataFrame,
     sleep_df: pd.DataFrame,
@@ -1228,28 +1248,88 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
     with ThreadPoolExecutor(min(6, max(1, len(chunks)))) as ex:
         chunk_results = list(ex.map(fetch_chunk, chunks))
 
-    sleep_rows, hrv_rows, daily_by_date = [], [], {}
+    sleep_rows, nap_raw_list, hrv_rows, daily_by_date, bb_naps_by_date = [], [], [], {}, {}
 
     for sl_raw, hrv_raw, ds_raw, st_raw, sr_raw in chunk_results:
-        # Sleep
+        # Daily summaries first so Body Battery nap events can enrich sleep/nap records
+        for d_item in _extract_list(ds_raw, "data", "dailySummaries", "summaries"):
+            if not isinstance(d_item, dict):
+                continue
+            d_str = d_item.get("calendarDate")
+            if not d_str:
+                continue
+            mov = d_item.get("movement") or {}
+            hr_obj = d_item.get("heartRate") or {}
+            bb_obj = d_item.get("bodyBattery") or {}
+            str_obj = d_item.get("stress") or {}
+            resp_obj = d_item.get("respiration") or {}
+            dyn_fb = (bb_obj.get("dynamicFeedbackEvent") or {}) if isinstance(bb_obj, dict) else {}
+            act_events = (bb_obj.get("activityEvents") or []) if isinstance(bb_obj, dict) else []
+            for ev in act_events:
+                if isinstance(ev, dict) and str(ev.get("eventType") or "").upper() in ("NAP", "RECOVERY"):
+                    bb_naps_by_date.setdefault(d_str, []).append({
+                        "event_type": str(ev.get("eventType") or "NAP").upper(),
+                        "start_local": pd.to_datetime(ev.get("eventStartTimeLocal") or ev.get("eventStartTimeGmt"), errors="coerce"),
+                        "duration_min": float(ev.get("durationInMillis") or 0) / 60000.0,
+                        "bb_impact": int(ev.get("bodyBatteryImpact") or 0),
+                        "feedback_type": ev.get("feedbackType"),
+                        "short_feedback": ev.get("shortFeedback"),
+                    })
+            steps_val = (
+                (mov.get("steps") or {}).get("value")
+                if isinstance(mov.get("steps"), dict)
+                else mov.get("steps") or d_item.get("totalSteps")
+            )
+            daily_by_date[d_str] = {
+                "date": pd.Timestamp(d_str),
+                "steps": steps_val,
+                "resting_hr": hr_obj.get("restingValue") or d_item.get("restingHeartRate"),
+                "body_battery_high": bb_obj.get("maxValue") or d_item.get("bodyBatteryHighestValue"),
+                "body_battery_min": bb_obj.get("minValue") or d_item.get("bodyBatteryLowestValue"),
+                "body_battery_latest": bb_obj.get("latestValue"),
+                "body_battery_charged": bb_obj.get("chargedValue") or d_item.get("bodyBatteryChargedValue"),
+                "body_battery_drained": bb_obj.get("drainedValue") or d_item.get("bodyBatteryDrainedValue"),
+                "bb_feedback": dyn_fb.get("feedbackLongType") or dyn_fb.get("feedbackShortType"),
+                "stress": str_obj.get("avgLevel") or d_item.get("averageStressLevel"),
+                "respiration": resp_obj.get("avgValue") if isinstance(resp_obj, dict) else None,
+            }
+
+        # Sleep & Naps
         for s in _extract_list(sl_raw, "sleepSummaries", "dailySleepSummaries", "data"):
             dto = s.get("dailySleepDTO") if isinstance(s, dict) and "dailySleepDTO" in s else s
             if not isinstance(dto, dict):
                 continue
             d_str = dto.get("calendarDate")
             tot_s = dto.get("sleepTimeSeconds") or dto.get("durationInSeconds")
-            if d_str and tot_s:
+            nap_s = float(dto.get("napTimeSeconds") or 0.0)
+            nap_dtos = dto.get("dailyNapDTOS") or (s.get("dailyNapDTOS") if isinstance(s, dict) else None) or []
+            sleep_need = dto.get("sleepNeed") or (s.get("sleepNeed") if isinstance(s, dict) else None) or {}
+            next_need = dto.get("nextSleepNeed") or (s.get("nextSleepNeed") if isinstance(s, dict) else None) or {}
+            need_actual = sleep_need.get("actual") or next_need.get("actual")
+            need_base = sleep_need.get("baseline") or next_need.get("baseline")
+            next_actual = next_need.get("actual") or sleep_need.get("actual")
+            nap_adj = next_need.get("napAdjustment") or sleep_need.get("napAdjustment") or "NO_CHANGE"
+
+            if d_str and (tot_s or nap_s > 0):
                 scores = dto.get("sleepScores") or {}
                 score_val = (scores.get("overall") or {}).get("value") if isinstance(scores, dict) else None
                 if score_val is None:
                     score_val = dto.get("overallSleepScore") or dto.get("sleepScore")
+                tot_h_val = float(tot_s or 0.0) / 3600.0
                 sleep_rows.append({
                     "date": pd.Timestamp(d_str),
-                    "total_h": float(tot_s) / 3600.0,
+                    "total_h": tot_h_val,
                     "deep_h": float(dto.get("deepSleepSeconds") or 0) / 3600.0,
                     "light_h": float(dto.get("lightSleepSeconds") or 0) / 3600.0,
                     "rem_h": float(dto.get("remSleepSeconds") or 0) / 3600.0,
                     "awake_h": float(dto.get("awakeSleepSeconds") or 0) / 3600.0,
+                    "nap_min": nap_s / 60.0,
+                    "nap_count": len(nap_dtos) if nap_dtos else (1 if nap_s > 0 else 0),
+                    "total_with_naps_h": tot_h_val + (nap_s / 3600.0),
+                    "sleep_need_min": float(need_actual) if need_actual is not None else None,
+                    "baseline_need_min": float(need_base) if need_base is not None else None,
+                    "next_sleep_need_min": float(next_actual) if next_actual is not None else None,
+                    "nap_adjustment": nap_adj,
                     "score": score_val,
                     "sleep_stress": dto.get("avgSleepStress"),
                     "sleep_hr": dto.get("avgHeartRate"),
@@ -1257,6 +1337,34 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
                     "feedback": dto.get("sleepScoreFeedback"),
                     "insight": dto.get("sleepScorePersonalizedInsight") or dto.get("sleepScoreInsight"),
                 })
+                for nd in nap_dtos:
+                    if not isinstance(nd, dict):
+                        continue
+                    nd_date = nd.get("calendarDate") or d_str
+                    dur_sec = float(nd.get("napTimeSec") or nap_s or 0.0)
+                    if dur_sec <= 0:
+                        continue
+                    st_gmt = pd.to_datetime(nd.get("napStartTimestampGMT"), errors="coerce")
+                    en_gmt = pd.to_datetime(nd.get("napEndTimestampGMT"), errors="coerce")
+                    off_st = float(nd.get("napStartTimeOffset") or 0.0)
+                    off_en = float(nd.get("napEndTimeOffset") or off_st)
+                    st_loc = st_gmt + pd.Timedelta(minutes=off_st) if pd.notna(st_gmt) else pd.Timestamp(nd_date)
+                    en_loc = en_gmt + pd.Timedelta(minutes=off_en) if pd.notna(en_gmt) else st_loc + pd.Timedelta(seconds=dur_sec)
+                    raw_fb = nd.get("napFeedback") or "NONE"
+                    src_code = nd.get("napSource")
+                    nap_raw_list.append({
+                        "date": pd.Timestamp(nd_date),
+                        "start_local": st_loc,
+                        "end_local": en_loc,
+                        "duration_min": round(dur_sec / 60.0, 1),
+                        "raw_feedback": raw_fb,
+                        "feedback": _format_nap_feedback(raw_fb),
+                        "source": "Manual / Timer" if src_code == 1 else "Auto-Detected",
+                        "night_sleep_h": round(tot_h_val, 2),
+                        "sleep_score": score_val,
+                        "next_sleep_need_min": float(next_actual) if next_actual is not None else None,
+                        "nap_adjustment": nap_adj,
+                    })
 
         # HRV
         for h in _extract_list(hrv_raw, "hrvSummaries", "data"):
@@ -1276,38 +1384,6 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
                     "high": base.get("balancedUpper") or base.get("highBalanced"),
                     "low_upper": base.get("lowUpper"),
                 })
-
-        # Daily summaries (v2 or flat)
-        for d_item in _extract_list(ds_raw, "data", "dailySummaries", "summaries"):
-            if not isinstance(d_item, dict):
-                continue
-            d_str = d_item.get("calendarDate")
-            if not d_str:
-                continue
-            mov = d_item.get("movement") or {}
-            hr_obj = d_item.get("heartRate") or {}
-            bb_obj = d_item.get("bodyBattery") or {}
-            str_obj = d_item.get("stress") or {}
-            resp_obj = d_item.get("respiration") or {}
-            dyn_fb = (bb_obj.get("dynamicFeedbackEvent") or {}) if isinstance(bb_obj, dict) else {}
-            steps_val = (
-                (mov.get("steps") or {}).get("value")
-                if isinstance(mov.get("steps"), dict)
-                else mov.get("steps") or d_item.get("totalSteps")
-            )
-            daily_by_date[d_str] = {
-                "date": pd.Timestamp(d_str),
-                "steps": steps_val,
-                "resting_hr": hr_obj.get("restingValue") or d_item.get("restingHeartRate"),
-                "body_battery_high": bb_obj.get("maxValue") or d_item.get("bodyBatteryHighestValue"),
-                "body_battery_min": bb_obj.get("minValue") or d_item.get("bodyBatteryLowestValue"),
-                "body_battery_latest": bb_obj.get("latestValue"),
-                "body_battery_charged": bb_obj.get("chargedValue") or d_item.get("bodyBatteryChargedValue"),
-                "body_battery_drained": bb_obj.get("drainedValue") or d_item.get("bodyBatteryDrainedValue"),
-                "bb_feedback": dyn_fb.get("feedbackLongType") or dyn_fb.get("feedbackShortType"),
-                "stress": str_obj.get("avgLevel") or d_item.get("averageStressLevel"),
-                "respiration": resp_obj.get("avgValue") if isinstance(resp_obj, dict) else None,
-            }
 
         # Supplement steps & stress from stats endpoints if v2 didn't populate them
         for st_item in _extract_list(st_raw, "data", "steps"):
@@ -1331,8 +1407,64 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
                         rec["stress"] = val
 
     sleep_df = pd.DataFrame(sleep_rows).sort_values("date").drop_duplicates("date") if sleep_rows else pd.DataFrame(
-        columns=["date", "total_h", "deep_h", "light_h", "rem_h", "awake_h", "score", "sleep_stress", "sleep_hr", "respiration", "feedback", "insight"]
+        columns=["date", "total_h", "deep_h", "light_h", "rem_h", "awake_h", "nap_min", "nap_count", "total_with_naps_h", "sleep_need_min", "baseline_need_min", "next_sleep_need_min", "nap_adjustment", "score", "sleep_stress", "sleep_hr", "respiration", "feedback", "insight"]
     )
+
+    # Enrich nap records with Body Battery impact & feedback from daily summaries
+    enriched_naps = []
+    matched_bb_dates = set()
+    for nr in nap_raw_list:
+        d_key = nr["date"].strftime("%Y-%m-%d")
+        bb_candidates = [e for e in bb_naps_by_date.get(d_key, []) if e.get("event_type") == "NAP"]
+        bb_imp = None
+        bb_fb = None
+        if bb_candidates:
+            matched_bb_dates.add(d_key)
+            best_ev = bb_candidates[0]
+            if pd.notna(nr.get("start_local")):
+                best_ev = min(
+                    bb_candidates,
+                    key=lambda ev: abs((ev["start_local"] - nr["start_local"]).total_seconds()) if pd.notna(ev.get("start_local")) else 999999,
+                )
+            bb_imp = best_ev.get("bb_impact")
+            bb_fb = _format_nap_feedback(best_ev.get("short_feedback") or best_ev.get("feedback_type"))
+        nr_copy = dict(nr)
+        nr_copy["bb_impact"] = bb_imp
+        nr_copy["bb_feedback"] = bb_fb
+        enriched_naps.append(nr_copy)
+
+    # Include any Body Battery NAP events not already in dailyNapDTOS
+    for d_key, ev_list in bb_naps_by_date.items():
+        if d_key in matched_bb_dates:
+            continue
+        for ev in ev_list:
+            if ev.get("event_type") == "NAP" and ev.get("duration_min", 0) > 0:
+                st_loc = ev.get("start_local") if pd.notna(ev.get("start_local")) else pd.Timestamp(d_key)
+                dur_m = round(float(ev.get("duration_min") or 0.0), 1)
+                enriched_naps.append({
+                    "date": pd.Timestamp(d_key),
+                    "start_local": st_loc,
+                    "end_local": st_loc + pd.Timedelta(minutes=dur_m),
+                    "duration_min": dur_m,
+                    "raw_feedback": ev.get("feedback_type") or "NONE",
+                    "feedback": _format_nap_feedback(ev.get("short_feedback") or ev.get("feedback_type")),
+                    "source": "Auto-Detected",
+                    "night_sleep_h": None,
+                    "sleep_score": None,
+                    "next_sleep_need_min": None,
+                    "nap_adjustment": "NO_CHANGE",
+                    "bb_impact": ev.get("bb_impact"),
+                    "bb_feedback": _format_nap_feedback(ev.get("short_feedback") or ev.get("feedback_type")),
+                })
+
+    naps_df = (
+        pd.DataFrame(enriched_naps).sort_values("start_local", ascending=False).reset_index(drop=True)
+        if enriched_naps
+        else pd.DataFrame(
+            columns=["date", "start_local", "end_local", "duration_min", "raw_feedback", "feedback", "source", "night_sleep_h", "sleep_score", "next_sleep_need_min", "nap_adjustment", "bb_impact", "bb_feedback"]
+        )
+    )
+
     hrv_df = pd.DataFrame(hrv_rows).sort_values("date").drop_duplicates("date") if hrv_rows else pd.DataFrame(
         columns=["date", "hrv", "weekly_avg", "status", "low", "high", "low_upper"]
     )
@@ -1407,6 +1539,7 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
         "activities": acts,
         "all_activities": all_acts,
         "sleep": sleep_df,
+        "naps": naps_df,
         "hrv": hrv_df,
         "daily": daily_df,
         "vo2max": vo2_df,
@@ -1501,7 +1634,9 @@ def fetch_live(g, days: int) -> dict:
     raw_ts = _safe(g.get_training_status, end.isoformat(), default=None)
     training_status = _compute_training_status(acts, vo2_df, hrv_df, daily_df, days, raw_ts=raw_ts, sleep_df=sleep_df)
 
-    return {"activities": acts, "all_activities": acts, "sleep": sleep_df, "hrv": hrv_df,
+    return {"activities": acts, "all_activities": acts, "sleep": sleep_df,
+            "naps": pd.DataFrame(columns=["date", "start_local", "end_local", "duration_min", "raw_feedback", "feedback", "source", "night_sleep_h", "sleep_score", "next_sleep_need_min", "nap_adjustment", "bb_impact", "bb_feedback"]),
+            "hrv": hrv_df,
             "daily": daily_df, "vo2max": vo2_df, "predictions": preds,
             "race_details": race_details, "body_state": body_state,
             "training_status": training_status}
@@ -1538,13 +1673,38 @@ def demo(days: int) -> dict:
     tot = rng.normal(7.2, .7, len(idx)).clip(4.5, 9)
     deep = tot * rng.uniform(.14, .22, len(idx)); rem = tot * rng.uniform(.18, .26, len(idx))
     awake = tot * rng.uniform(.02, .07, len(idx))
+    nap_mins = np.where(rng.random(len(idx)) < 0.22, rng.choice([20.0, 25.0, 35.0, 60.0], size=len(idx)), 0.0)
     sleep = pd.DataFrame({"date": idx, "total_h": tot, "deep_h": deep, "rem_h": rem,
                           "light_h": tot - deep - rem, "awake_h": awake,
+                          "nap_min": nap_mins, "nap_count": (nap_mins > 0).astype(int),
+                          "total_with_naps_h": tot + nap_mins / 60.0,
+                          "sleep_need_min": 480.0, "baseline_need_min": 480.0, "next_sleep_need_min": 480.0 - nap_mins * 0.5,
+                          "nap_adjustment": np.where(nap_mins > 0, "DECREASING", "NO_CHANGE"),
                           "score": (tot / 8 * 80 + rng.normal(0, 6, len(idx))).clip(40, 100),
                           "sleep_stress": rng.integers(12, 28, len(idx)),
                           "sleep_hr": rng.integers(54, 65, len(idx)),
                           "respiration": rng.integers(14, 17, len(idx)),
                           "feedback": None, "insight": None})
+    demo_naps = []
+    for d_val, nm, sc_v, tot_v in zip(idx, nap_mins, sleep["score"], tot):
+        if nm > 0:
+            st_l = d_val + pd.Timedelta(hours=14, minutes=int(rng.integers(0, 90)))
+            demo_naps.append({
+                "date": d_val,
+                "start_local": st_l,
+                "end_local": st_l + pd.Timedelta(minutes=float(nm)),
+                "duration_min": float(nm),
+                "raw_feedback": "IDEAL_TIMING_IDEAL_DURATION_LOW_NEED" if nm <= 30 else "LONG_DURATION_LOW_NEED",
+                "feedback": _format_nap_feedback("IDEAL_TIMING_IDEAL_DURATION_LOW_NEED" if nm <= 30 else "LONG_DURATION_LOW_NEED"),
+                "source": "Manual / Timer" if nm <= 25 else "Auto-Detected",
+                "night_sleep_h": round(float(tot_v), 2),
+                "sleep_score": round(float(sc_v), 0),
+                "next_sleep_need_min": round(480.0 - float(nm) * 0.5, 0),
+                "nap_adjustment": "DECREASING",
+                "bb_impact": int(rng.integers(3, 9)),
+                "bb_feedback": "Restful nap (+Body Battery recharge)",
+            })
+    naps_df = pd.DataFrame(demo_naps).sort_values("start_local", ascending=False).reset_index(drop=True) if demo_naps else pd.DataFrame()
     hrv_v = 62 + np.cumsum(rng.normal(0, 1.5, len(idx))) * .4 + rng.normal(0, 5, len(idx))
     hrv = pd.DataFrame({"date": idx, "hrv": hrv_v, "weekly_avg": pd.Series(hrv_v).rolling(7, min_periods=1).mean(),
                         "low": 52, "high": 72, "low_upper": 49, "status": "BALANCED"})
@@ -1562,7 +1722,7 @@ def demo(days: int) -> dict:
     body_state = compute_body_state_now(acts, sleep, hrv, daily)
     preds, race_details = compute_race_predictions(float(vo2["vo2max"].iloc[-1]), acts, all_acts=acts, daily_df=daily, body_state=body_state)
     training_status = _compute_training_status(acts, vo2, hrv, daily, days, sleep_df=sleep)
-    return {"activities": acts, "all_activities": acts, "sleep": sleep, "hrv": hrv, "daily": daily, "vo2max": vo2,
+    return {"activities": acts, "all_activities": acts, "sleep": sleep, "naps": naps_df, "hrv": hrv, "daily": daily, "vo2max": vo2,
             "predictions": preds, "race_details": race_details, "body_state": body_state,
             "training_status": training_status}
 
