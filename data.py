@@ -47,6 +47,10 @@ def _chunk_dates(start: date, end: date, max_days: int = 28):
         cur = nxt + timedelta(days=1)
 
 
+# Watch-identified Max HR ceiling (Garmin Personal API does not expose user profile HR zones)
+WATCH_MAX_HR = 202.0
+
+
 def _daniels_vdot(dist_m: float, time_s: float) -> float:
     """Exact Jack Daniels & Jimmy Gilbert VDOT from race/effort distance (m) and duration (s)."""
     if not dist_m or not time_s or dist_m <= 0 or time_s <= 0:
@@ -94,13 +98,13 @@ def compute_race_predictions(
         else pd.DataFrame()
     )
 
-    # Determine Resting HR and Max HR for HR-reserve calibration
+    # Determine Resting HR and Watch Max HR (202 bpm) for HR-reserve calibration
     rhr = 54.0
     if daily_df is not None and not daily_df.empty and "resting_hr" in daily_df.columns and daily_df["resting_hr"].notna().any():
         rhr = float(daily_df["resting_hr"].dropna().tail(28).median())
-    mhr = 195.0
+    mhr = WATCH_MAX_HR
     if not runs.empty and "max_hr" in runs.columns and runs["max_hr"].notna().any():
-        mhr = max(190.0, float(runs["max_hr"].dropna().max()))
+        mhr = max(WATCH_MAX_HR, float(runs["max_hr"].dropna().max()))
 
     benchmarks = []
     submax_samples = []
@@ -442,7 +446,7 @@ def _estimate_activity_load(row: pd.Series) -> float:
     mhr = row.get("max_hr")
     if hr is not None and pd.notna(hr) and float(hr) > 60:
         hr_f = float(hr)
-        mhr_f = max(185.0, float(mhr)) if mhr is not None and pd.notna(mhr) and float(mhr) > hr_f else 188.0
+        mhr_f = max(WATCH_MAX_HR, float(mhr)) if mhr is not None and pd.notna(mhr) and float(mhr) > hr_f else WATCH_MAX_HR
         intensity = np.clip((hr_f - 60.0) / max(40.0, mhr_f - 60.0), 0.25, 1.0)
         return round(dur * (intensity ** 2.0) * 2.6, 1)
     cat_factor = {"Run": 1.85, "Cycling": 1.35, "Walk": 0.65}.get(row.get("category"), 1.1)
@@ -977,7 +981,7 @@ def _compute_training_status(
             ana_te = float(r.get("anaerobic_te") or 0.0) if pd.notna(r.get("anaerobic_te")) else 0.0
             aer_te = float(r.get("training_effect") or 0.0) if pd.notna(r.get("training_effect")) else 0.0
             hr = float(r.get("avg_hr") or 0.0) if pd.notna(r.get("avg_hr")) else 0.0
-            mhr = float(r.get("max_hr") or 188.0) if pd.notna(r.get("max_hr")) and float(r.get("max_hr") or 0) > 120 else 188.0
+            mhr = max(WATCH_MAX_HR, float(r.get("max_hr") or WATCH_MAX_HR)) if pd.notna(r.get("max_hr")) else WATCH_MAX_HR
             if ana_te >= 2.0 or (hr > 0 and hr / mhr >= 0.89):
                 focus_totals["Anaerobic"] += ld * 0.45
                 focus_totals["High Aerobic"] += ld * 0.55
@@ -1348,7 +1352,7 @@ def fetch_official_api(client: GarminPersonalAPIClient, days: int) -> dict:
         if not runs.empty:
             recent_rhr = daily_df.tail(28)["resting_hr"].dropna() if not daily_df.empty and "resting_hr" in daily_df.columns else pd.Series(dtype=float)
             rhr = float(recent_rhr.median()) if not recent_rhr.empty else 53.0
-            mhr = max(195.0, float(all_acts["max_hr"].max()) if all_acts["max_hr"].notna().any() else 195.0)
+            mhr = max(WATCH_MAX_HR, float(all_acts["max_hr"].max()) if all_acts["max_hr"].notna().any() else WATCH_MAX_HR)
             est_rows = []
             for _, r in runs.iterrows():
                 eff_mps = float(r.get("eff_speed_mps") or 0.0)

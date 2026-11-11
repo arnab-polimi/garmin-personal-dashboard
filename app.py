@@ -1586,7 +1586,7 @@ with tabs[7]:
             f'falsely predicted a ~22:25 5K and ~46:26 10K.<br>'
             f'    <b>2. Exact Jack Daniels & Gilbert VDOT Solver:</b> We compute your true performance <b>VDOT ({eff_vdot:.2f})</b> directly from your verified race/split efforts '
             f'(e.g., <b>10.19 km in 57:25 @ 5:38/km = 34.8 VDOT</b> & <b>5K split in 27:22 = 34.4 VDOT</b>) blended with your last 6 weeks of HR-calibrated quality runs '
-            f'(solving <code>VO₂(v) = -4.60 + 0.182258·v + 0.000104·v²</code> divided by <code>%HRR</code> between RHR {rd.get("rhr_used", 55):.0f} and Max HR {rd.get("mhr_used", 195):.0f} bpm, giving <b>{submax_vdot or eff_vdot:.1f} VDOT</b>).<br>'
+            f'(solving <code>VO₂(v) = -4.60 + 0.182258·v + 0.000104·v²</code> divided by <code>%HRR</code> between RHR {rd.get("rhr_used", 55):.0f} and watch Max HR {rd.get("mhr_used", 202):.0f} bpm, giving <b>{submax_vdot or eff_vdot:.1f} VDOT</b>).<br>'
             f'    <b>3. Time-Dependent %VO₂max & Mileage Endurance Factor:</b> For each race distance, we iteratively solve '
             f'<code>VO₂(d/t) / [0.8 + 0.1894·e^(-0.0128·t) + 0.2989·e^(-0.1933·t)] = VDOT</code>, then apply a Riegel endurance adjustment for Half Marathon (<b>+{(end_mult.get("Half marathon", 1)-1)*100:.1f}%</b>) '
             f'and Marathon (<b>+{(end_mult.get("Marathon", 1)-1)*100:.1f}%</b>) based on your current 4-week volume (<b>{wk_km:.1f} km/wk</b>) and longest run (<b>{long_km:.1f} km</b>).'
